@@ -1,0 +1,25 @@
+# Secrets
+.t800_env
+*.env
+*.key
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pkl
+
+# TTS models (too large for git)
+*.onnx
+*.onnx.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Arduino build artifacts
+esp32/build/
