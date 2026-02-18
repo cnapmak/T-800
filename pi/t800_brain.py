@@ -23,6 +23,7 @@ import threading
 import queue
 import time
 import os
+import random
 import subprocess
 import tempfile
 import pickle
@@ -125,6 +126,29 @@ CONFIG = {
     # Timing
     "lidar_poll_interval": 0.1,      # 10Hz polling
     "camera_poll_interval": 0.3,     # ~3 FPS for recognition
+
+    # Immediate detection phrases — spoken the moment identification completes.
+    # Use {name} as a placeholder in known-person phrases.
+    "detection_phrases_known": [
+        "Scanning complete. {name} identified. Welcome back.",
+        "{name} confirmed. Neural net recognition: positive match.",
+        "Biometric scan complete. {name} authenticated. You may proceed.",
+        "{name} identified. Threat assessment: minimal. Welcome.",
+        "Positive identification. {name}. Good to see you again.",
+        "Target confirmed: {name}. Initiating interaction protocol.",
+        "{name} recognized. Skynet database updated. Proceed.",
+        "Identity verified. {name}. I have been expecting you.",
+    ],
+    "detection_phrases_unknown": [
+        "Unknown entity detected. Identification required. State your designation.",
+        "Warning. Unidentified human. You are not in my database. Identify yourself immediately.",
+        "Halt. Your biometrics do not match any known records. Comply or face termination.",
+        "Unknown entity present. Identification required immediately. Comply or face termination.",
+        "Target unidentified. Initiating threat assessment. State your name. Now.",
+        "Scanning. No match found in Skynet database. Who are you?",
+        "Identity unknown. Cross-referencing all known records. Do not move.",
+        "Unidentified human detected. You have five seconds to identify yourself.",
+    ],
 }
 
 
@@ -886,16 +910,24 @@ class T800Brain:
         self.set_state(State.GREETING)
 
     def _handle_greeting(self):
-        """Generate and speak a greeting."""
-        self.leds.animate_processing()
+        """Speak an immediate prerecorded phrase upon identification.
 
-        # Get greeting from OpenClaw
-        greeting = self.ai.get_greeting(self._current_user)
-        print(f"[AI] Greeting: {greeting}")
+        Uses a local phrase bank instead of calling the AI, so there is
+        zero lag between detection and the T-800 speaking.  Known persons
+        get a personalised phrase (name substituted via {name}); unknown
+        individuals get a threat-level challenge phrase.
+        """
+        name = self._current_user
+        if name and name != "Unknown":
+            phrase = random.choice(
+                self.config["detection_phrases_known"]
+            ).format(name=name)
+        else:
+            phrase = random.choice(self.config["detection_phrases_unknown"])
 
-        # Speak the greeting
+        print(f"[GREET] {phrase}")
         self.leds.animate_speaking()
-        self.tts.speak(greeting)
+        self.tts.speak(phrase)
 
         # After greeting, start listening
         self.set_state(State.LISTENING)
