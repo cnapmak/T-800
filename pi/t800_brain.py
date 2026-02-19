@@ -127,8 +127,14 @@ CONFIG = {
     "lidar_poll_interval": 0.1,      # 10Hz polling
     "camera_poll_interval": 0.3,     # ~3 FPS for recognition
 
+    # Distance zone thresholds (cm).  Used to classify how close a target is.
+    "zone_close_cm": 80,    # ≤ 80 cm  → "close"  (within arm's reach)
+    "zone_medium_cm": 150,  # ≤ 150 cm → "medium" (conversational distance)
+                            # > 150 cm → "far"    (edge of detection range)
+
     # Immediate detection phrases — spoken the moment identification completes.
-    # Use {name} as a placeholder in known-person phrases.
+    # Supported placeholders: {name}, {distance_cm}, {zone}
+    # Extra placeholders are always substituted; unused ones are safely ignored.
     "detection_phrases_known": [
         "Scanning complete. {name} identified. Welcome back.",
         "{name} confirmed. Neural net recognition: positive match.",
@@ -138,6 +144,8 @@ CONFIG = {
         "Target confirmed: {name}. Initiating interaction protocol.",
         "{name} recognized. Skynet database updated. Proceed.",
         "Identity verified. {name}. I have been expecting you.",
+        "Target {name} at {distance_cm} centimeters. Threat level nominal.",
+        "{name} detected. Range: {distance_cm} centimeters. Standing by.",
     ],
     "detection_phrases_unknown": [
         "Unknown entity detected. Identification required. State your designation.",
@@ -148,6 +156,8 @@ CONFIG = {
         "Scanning. No match found in Skynet database. Who are you?",
         "Identity unknown. Cross-referencing all known records. Do not move.",
         "Unidentified human detected. You have five seconds to identify yourself.",
+        "Unknown entity at {distance_cm} centimeters. State your name and purpose.",
+        "Unidentified target. Range: {distance_cm} centimeters. You are within termination range.",
     ],
 }
 
@@ -794,6 +804,23 @@ class T800Brain:
         with self._state_lock:
             return self.state
 
+    def _distance_zone(self, distance_cm):
+        """Classify a raw LiDAR distance into a named zone.
+
+        Returns (zone_name, description) where zone_name is one of:
+            "close"  — within arm's reach (≤ zone_close_cm)
+            "medium" — conversational distance (≤ zone_medium_cm)
+            "far"    — edge of detection range (> zone_medium_cm)
+        """
+        close_thresh = self.config.get("zone_close_cm", 80)
+        medium_thresh = self.config.get("zone_medium_cm", 150)
+        if distance_cm <= close_thresh:
+            return "close", "close range — within arm's reach"
+        elif distance_cm <= medium_thresh:
+            return "medium", "medium range — conversational distance"
+        else:
+            return "far", "far range — edge of detection"
+
     def startup(self):
         """Initialize all subsystems."""
         print("""
@@ -916,16 +943,27 @@ class T800Brain:
         zero lag between detection and the T-800 speaking.  Known persons
         get a personalised phrase (name substituted via {name}); unknown
         individuals get a threat-level challenge phrase.
+
+        All phrases may optionally use {distance_cm} and {zone} placeholders;
+        unused placeholders are silently ignored by str.format().
         """
         name = self._current_user
+        status = self.lidar.get_status()
+        distance_cm = status["distance"]
+        zone, _zone_desc = self._distance_zone(distance_cm)
+
+        fmt_kwargs = dict(name=name or "unknown", distance_cm=distance_cm, zone=zone)
+
         if name and name != "Unknown":
             phrase = random.choice(
                 self.config["detection_phrases_known"]
-            ).format(name=name)
+            ).format(**fmt_kwargs)
         else:
-            phrase = random.choice(self.config["detection_phrases_unknown"])
+            phrase = random.choice(
+                self.config["detection_phrases_unknown"]
+            ).format(**fmt_kwargs)
 
-        print(f"[GREET] {phrase}")
+        print(f"[GREET] [{zone} / {distance_cm}cm] {phrase}")
         self.leds.animate_speaking()
         self.tts.speak(phrase)
 
@@ -976,10 +1014,18 @@ class T800Brain:
         """Send user input to OpenClaw and get response."""
         self.leds.animate_processing()
 
-        # Build context
-        context = ""
+        # Build context — include live distance so the AI can reference proximity
+        status = self.lidar.get_status()
+        distance_cm = status["distance"]
+        zone, zone_desc = self._distance_zone(distance_cm)
+
+        context_parts = []
         if self._current_user and self._current_user != "Unknown":
-            context = f"You are speaking with {self._current_user}."
+            context_parts.append(f"You are speaking with {self._current_user}.")
+        context_parts.append(
+            f"Current target range: {distance_cm}cm ({zone_desc})."
+        )
+        context = " ".join(context_parts)
 
         text = self._last_heard
         if not text:
