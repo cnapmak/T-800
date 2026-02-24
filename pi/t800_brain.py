@@ -171,7 +171,7 @@ CONFIG = {
     "led_brightness": 0.1,
 
     # OpenClaw — absolute path + agent name
-    "openclaw_cmd": "/usr/local/bin/openclaw",
+    "openclaw_cmd": "/home/aleksey/.npm-global/bin/openclaw",
     "openclaw_agent": "main",
 
     # Timing
