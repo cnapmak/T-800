@@ -208,7 +208,7 @@ CONFIG = {
 
     # OpenClaw — absolute path + agent name
     "openclaw_cmd": "/home/aleksey/.npm-global/bin/openclaw",
-    "openclaw_agent": "main",
+    "openclaw_agent": "t800",
 
     # Timing
     "lidar_poll_interval": 0.1,      # 10Hz polling
@@ -921,7 +921,7 @@ class TTSSystem:
             piper_proc.stdin.close()
 
             # Wait for both to finish
-            aplay_proc.wait(timeout=60)
+            aplay_proc.wait(timeout=30)
             piper_proc.wait(timeout=5)
 
             if piper_proc.returncode != 0:
@@ -1007,6 +1007,32 @@ class OpenClawAI:
             print("[AI] WARNING: OpenClaw not found in PATH")
             print(f"[AI]   Tried: {self.cmd}")
 
+    @staticmethod
+    def _clean_for_tts(text, max_chars=500):
+        """Strip markdown and cap length so TTS doesn't choke."""
+        import re
+        # Remove markdown formatting
+        text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)   # **bold**
+        text = re.sub(r'\*(.+?)\*', r'\1', text)        # *italic*
+        text = re.sub(r'`[^`]+`', '', text)              # `code`
+        text = re.sub(r'```[\s\S]*?```', '', text)       # code blocks
+        text = re.sub(r'^[-*•]\s+', '', text, flags=re.MULTILINE)  # bullet points
+        text = re.sub(r'^#+\s+', '', text, flags=re.MULTILINE)     # headings
+        text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)  # links
+        # Collapse whitespace
+        text = re.sub(r'\n{2,}', '. ', text)
+        text = re.sub(r'\n', ' ', text)
+        text = re.sub(r'\s{2,}', ' ', text).strip()
+        # Cap length — cut at last sentence boundary before limit
+        if len(text) > max_chars:
+            cut = text[:max_chars]
+            last_period = max(cut.rfind('.'), cut.rfind('!'), cut.rfind('?'))
+            if last_period > max_chars // 2:
+                text = cut[:last_period + 1]
+            else:
+                text = cut.rsplit(' ', 1)[0] + '...'
+        return text
+
     def get_response(self, user_input, context=""):
         """
         Send input to OpenClaw and get T-800 response.
@@ -1017,11 +1043,11 @@ class OpenClawAI:
             result = subprocess.run(
                 [self.cmd, "agent", "--agent", self.agent_id,
                  "--message", full_input],
-                capture_output=True, text=True, timeout=60,
+                capture_output=True, text=True, timeout=30,
                 env=self._node_env
             )
             if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip()
+                return self._clean_for_tts(result.stdout.strip())
             else:
                 stderr_msg = result.stderr.strip()[:200] if result.stderr else "no output"
                 print(f"[AI] OpenClaw error (rc={result.returncode}): {stderr_msg}")
@@ -1138,8 +1164,7 @@ class T800Brain:
         self.ai.start()
         self.leds.start()
 
-        print("\n[BOOT] All systems online.")
-        print("[BOOT] Entering patrol mode...\n")
+        print("\n[BOOT] All systems online.\n")
 
         # Startup announcement (pause mic during TTS to prevent XRUN)
         self.speech.pause_mic()
@@ -1264,7 +1289,9 @@ class T800Brain:
 
     def _handle_detected(self):
         """Someone detected — flash LEDs and start identification."""
-        print(f"[DETECT] Person at {self.lidar.get_status()['distance']}cm")
+        status = self.lidar.get_status()
+        self._detect_distance = status["distance"]
+        print(f"[DETECT] Person at {self._detect_distance}cm")
         self.leds.animate_detected()
         time.sleep(0.5)  # brief flash animation
         self.set_state(State.IDENTIFYING)
@@ -1309,8 +1336,7 @@ class T800Brain:
         unused placeholders are silently ignored by str.format().
         """
         name = self._current_user
-        status = self.lidar.get_status()
-        distance_cm = status["distance"]
+        distance_cm = getattr(self, '_detect_distance', self.lidar.get_status()["distance"])
         zone, _zone_desc = self._distance_zone(distance_cm)
 
         fmt_kwargs = dict(name=name or "unknown", distance_cm=distance_cm, zone=zone)
@@ -1338,7 +1364,6 @@ class T800Brain:
         if not status["present"]:
             if time.time() - self._last_presence_time > self.config["absence_timeout_s"]:
                 print("[DETECT] Target lost. Returning to patrol mode.")
-                self._speak_safe("Target lost. Resuming patrol mode.")
                 self.set_state(State.IDLE)
                 return
         else:
