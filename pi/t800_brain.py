@@ -98,17 +98,53 @@ from openai import OpenAI
 _USER_HOME = "/home/aleksey"
 
 
+def _find_usb_mic_index():
+    """Auto-detect the best USB microphone for speech recognition.
+
+    Prefers dedicated USB mics (Shure MV6, Blue Yeti, etc.) over generic
+    USB audio adapters.  Falls back to any USB capture device.
+    Device indices change between reboots and sudo/non-sudo contexts.
+    """
+    _PREFERRED = {"MV6", "MV7", "Shure", "Blue", "Yeti", "AT2020", "Rode"}
+    try:
+        import speech_recognition as _sr
+        names = _sr.Microphone.list_microphone_names()
+        # First pass: look for a dedicated mic
+        for i, name in enumerate(names):
+            if any(pref in name for pref in _PREFERRED):
+                return i
+        # Second pass: any USB audio capture device
+        for i, name in enumerate(names):
+            if "USB" in name and "USB Audio" in name:
+                return i
+    except Exception:
+        pass
+    return 1  # fallback
+
+
+_USB_MIC_INDEX = _find_usb_mic_index()
+
+
 def _find_usb_audio_card():
-    """Auto-detect USB Audio Device card number (changes between reboots)."""
+    """Auto-detect USB Audio Device card number for speaker output.
+
+    Skips known microphone-only devices (e.g. Shure MV6) and picks
+    the generic USB Audio Device used for speaker output.
+    Card numbers change between reboots, so we detect dynamically.
+    """
+    _MIC_ONLY = {"MV6", "MV7", "Shure", "Blue", "Yeti"}  # mic-only USB devices
     try:
         result = subprocess.run(["aplay", "-l"], capture_output=True, text=True)
         for line in result.stdout.splitlines():
             if "USB Audio" in line and line.startswith("card "):
+                # Skip known microphone-only devices
+                if any(mic in line for mic in _MIC_ONLY):
+                    continue
                 card_num = line.split(":")[0].replace("card ", "").strip()
                 return f"plughw:{card_num},0"
     except Exception:
         pass
-    return "plughw:2,0"  # fallback
+    return "plughw:3,0"  # fallback
 
 
 _USB_AUDIO_DEVICE = _find_usb_audio_card()
@@ -152,8 +188,8 @@ CONFIG = {
     "face_model_path": os.path.join(_USER_HOME, "face_model.pkl"),
     "recognition_tolerance": 0.6,
 
-    # Microphone  (device_index=1 under sudo, no sample_rate override)
-    "mic_device_index": 1,
+    # Microphone — auto-detected (prefers dedicated USB mics like Shure MV6)
+    "mic_device_index": _USB_MIC_INDEX,
     "listen_timeout": 8,
     "phrase_time_limit": 15,
 
