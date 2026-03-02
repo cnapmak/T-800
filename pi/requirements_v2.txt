@@ -1,0 +1,24 @@
+# T-800 Brain v2 Dependencies
+# Install: sudo pip3 install -r requirements_v2.txt
+
+# Core hardware
+smbus2>=0.4.0           # I2C for TFmini LiDAR
+picamera2>=0.3.0        # Pi Camera
+neopixel-spi>=1.0.0     # WS2812B LED matrix via SPI
+adafruit-blinka>=8.0    # Board abstraction for neopixel
+
+# Face recognition
+face-recognition>=1.3.0 # dlib-based face recognition
+opencv-python>=4.5.0    # Image processing
+numpy>=1.21.0           # Array operations
+
+# Emotion detection (NEW in v2)
+fer>=22.5.1             # Facial Emotion Recognition (OpenCV backend)
+
+# Speech
+SpeechRecognition>=3.10 # Microphone capture
+PyAudio>=0.2.11         # Audio I/O
+openai>=1.0.0           # Whisper API for transcription
+
+# TTS handled by Piper binary (not a pip package)
+# Install Piper: https://github.com/rhasspy/piper
