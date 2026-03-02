@@ -100,12 +100,15 @@ from openai import OpenAI
 
 # FER for emotion detection (optional -- degrades gracefully)
 try:
-    from fer import FER
+    try:
+        from fer import FER           # fer >= 22.x
+    except ImportError:
+        from fer.fer import FER       # fer 25.x package layout
     _FER_AVAILABLE = True
 except ImportError:
     _FER_AVAILABLE = False
     print("[BOOT] FER not installed -- emotion detection disabled")
-    print("[BOOT]   Install with: sudo pip3 install fer")
+    print("[BOOT]   Install with: pip3 install fer --break-system-packages")
 
 
 # ── Home directory (always /home/aleksey, even under sudo) ───────
