@@ -2,11 +2,11 @@
 """
 T-800 Vision System
 Face detection + pan/tilt servo tracking using:
-  - picamera2               (Camera Module 3)
-  - MediaPipe               (model 0 only — proven reliable with this camera)
-  - OpenCV                  (display + HUD)
-  - adafruit-servokit       (PCA9685 16-ch PWM driver, I2C 0x40)
-  - TF Mini Plus            (I2C distance sensor, 0x10)
+  - picamera2          (Camera Module 3)
+  - MediaPipe          (model 0 only — proven reliable with this camera)
+  - OpenCV             (display + HUD)
+  - adafruit-servokit  (PCA9685 16-ch PWM driver, I2C 0x40)
+  - TF Mini Plus       (I2C distance sensor, 0x10)
 
 Detection strategy:
   Pass 1 — full 1280×720 frame          → catches faces 0–2 m
@@ -21,12 +21,9 @@ Usage:
 """
 
 import argparse
-import textwrap
 import threading
 import time
-import urllib.request
-import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import cv2
 import mediapipe as mp
@@ -125,128 +122,6 @@ def merge_dets(dets: list[Det], iou_thresh: float = 0.35) -> list[Det]:
             kept.append(d)
     return kept
 
-
-# ── Moondream / Ollama analyzer ───────────────────────────────────────────────
-
-OLLAMA_URL      = "http://localhost:11434/api/generate"
-OLLAMA_MODEL    = "moondream"
-OLLAMA_TIMEOUT  = 300  # seconds — moondream on Pi 5 can take ~2 min under load
-EMOTION_EVERY   = 15   # seconds between emotion queries (face crop)
-SCENE_EVERY     = 60   # seconds between scene queries (full frame)
-
-
-def _ollama_query(prompt: str, image_b64: str) -> str:
-    """Send an image + prompt to the local Ollama moondream model."""
-    payload = json.dumps({
-        "model":  OLLAMA_MODEL,
-        "prompt": prompt,
-        "images": [image_b64],
-        "stream": False,
-    }).encode()
-    req = urllib.request.Request(
-        OLLAMA_URL,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
-        return json.loads(resp.read())["response"].strip()
-
-
-class AIAnalyzer:
-    """
-    Runs Moondream (via local Ollama) in background threads.
-    Never blocks the main camera loop.
-    """
-
-    def __init__(self):
-        self._face_bgr:  np.ndarray | None = None
-        self._frame_bgr: np.ndarray | None = None
-        self._emotion  = ""
-        self._scene    = "AI initializing..."
-        self._lock     = threading.Lock()
-        self._ready    = False
-
-        threading.Thread(target=self._emotion_loop, daemon=True).start()
-        threading.Thread(target=self._scene_loop,   daemon=True).start()
-
-    # ── public interface ──────────────────────────────────────────────────────
-
-    def submit(self, frame: np.ndarray, det: "Det | None") -> None:
-        """Call once per frame with the latest frame and (optionally) a face Det."""
-        with self._lock:
-            self._frame_bgr = frame
-            if det is not None:
-                h, w = frame.shape[:2]
-                x  = max(0, int(det.xmin * w))
-                y  = max(0, int(det.ymin * h))
-                bw = min(int(det.w * w), w - x)
-                bh = min(int(det.h * h), h - y)
-                if bw > 20 and bh > 20:
-                    self._face_bgr = frame[y:y+bh, x:x+bw].copy()
-
-    @property
-    def emotion(self) -> str:
-        with self._lock:
-            return self._emotion
-
-    @property
-    def scene(self) -> str:
-        with self._lock:
-            return self._scene
-
-    @property
-    def ready(self) -> bool:
-        with self._lock:
-            return self._ready
-
-    # ── background threads ────────────────────────────────────────────────────
-
-    def _to_b64(self, img_rgb: np.ndarray) -> str:
-        import base64
-        bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-        ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 75])
-        return base64.b64encode(buf.tobytes()).decode() if ok else ""
-
-    def _emotion_loop(self):
-        # Warm up — wait for Ollama to be ready
-        time.sleep(5)
-        while True:
-            with self._lock:
-                face = self._face_bgr
-            if face is not None:
-                try:
-                    b64 = self._to_b64(face)
-                    ans = _ollama_query(
-                        "What is the dominant emotion of this person? "
-                        "Reply with exactly one word (e.g. happy, angry, neutral, sad, surprised, fearful).",
-                        b64,
-                    )
-                    with self._lock:
-                        self._emotion = ans.split()[0].upper() if ans else ""
-                except Exception as e:
-                    print("[AI] emotion query failed:", e)
-                finally:
-                    with self._lock:
-                        self._ready = True  # show result whether success or not
-            time.sleep(EMOTION_EVERY)
-
-    def _scene_loop(self):
-        time.sleep(10)   # let emotion loop run first
-        while True:
-            with self._lock:
-                frame = self._frame_bgr
-            if frame is not None:
-                try:
-                    b64 = self._to_b64(frame)
-                    ans = _ollama_query(
-                        "In 10 words or fewer, describe what this person is doing.",
-                        b64,
-                    )
-                    with self._lock:
-                        self._scene = ans
-                except Exception:
-                    pass
-            time.sleep(SCENE_EVERY)
 
 
 # ── TF Mini reader ─────────────────────────────────────────────────────────────
@@ -366,8 +241,7 @@ class ServoController:
 
 def draw_hud(frame: np.ndarray, dets: list[Det],
              dist_cm: int, strength: int, reliable: bool,
-             pan: float, tilt: float, servo_on: bool,
-             emotion: str = "", scene: str = "", ai_ready: bool = False) -> None:
+             pan: float, tilt: float, servo_on: bool) -> None:
     h, w = frame.shape[:2]
     cx, cy = w // 2, h // 2
 
@@ -432,27 +306,6 @@ def draw_hud(frame: np.ndarray, dets: list[Det],
     if filled:
         cv2.rectangle(frame, (bar_x, bar_y), (bar_x+filled, bar_y+bar_hh), range_col, -1)
 
-    # ── AI analysis panel (left side, below status) ───────────────────────────
-    if not ai_ready:
-        cv2.putText(frame, "AI: loading...", (10, 70),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, GRAY, 1, cv2.LINE_AA)
-    else:
-        if emotion:
-            cv2.putText(frame, "EMOTION: " + emotion, (10, 70),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, AMBER, 2, cv2.LINE_AA)
-
-    # ── Scene description banner (bottom, semi-transparent) ───────────────────
-    if scene and ai_ready:
-        lines = textwrap.wrap(scene, width=80)
-        banner_h = len(lines) * 22 + 10
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (0, h - banner_h - 30), (w, h - 30), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
-        for i, line in enumerate(lines):
-            cv2.putText(frame, line,
-                        (10, h - 30 - (len(lines) - 1 - i) * 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, AMBER, 1, cv2.LINE_AA)
-
     # ── Servo / controls ──────────────────────────────────────────────────────
     sv = "PAN {:+.2f}  TILT {:+.2f}".format(pan, tilt) if servo_on else "SERVO: offline"
     cv2.putText(frame, sv, (10, h-12), cv2.FONT_HERSHEY_SIMPLEX, 0.48, GREEN, 1, cv2.LINE_AA)
@@ -487,9 +340,6 @@ class T800Vision:
             print("[T-800] TF Mini online")
         except Exception as e:
             print("[T-800] TF Mini unavailable:", e)
-
-        # AI analyzer (Moondream via Ollama)
-        self.ai = AIAnalyzer()
 
         # Servos
         self.servos: ServoController | None = None
@@ -548,9 +398,6 @@ class T800Vision:
                     ey = (d.cy - 0.5) * 2
                     self.servos.update(ex, ey)
 
-                # Submit RGB frame to AI (Moondream handles RGB; we encode to JPEG)
-                self.ai.submit(frame_rgb, dets[0] if dets else None)
-
                 dist_cm, strength = self.tfmini.reading  if self.tfmini else (0, 0)
                 reliable          = self.tfmini.reliable if self.tfmini else False
                 pan  = self.servos.pan_val  if self.servos else 0.0
@@ -559,9 +406,7 @@ class T800Vision:
                 # Convert RGB → BGR for OpenCV HUD drawing and display
                 frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
                 draw_hud(frame_bgr, dets, dist_cm, strength, reliable,
-                         pan, tilt, servo_on=self.servos is not None,
-                         emotion=self.ai.emotion, scene=self.ai.scene,
-                         ai_ready=self.ai.ready)
+                         pan, tilt, servo_on=self.servos is not None)
                 cv2.imshow("T-800 Vision", frame_bgr)
 
                 key = cv2.waitKey(1) & 0xFF
