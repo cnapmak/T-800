@@ -1,0 +1,23 @@
+# T-800 Vision — Python dependencies
+#
+# Install on Raspberry Pi OS (Bookworm, 64-bit):
+#
+#   # System packages (faster + no compile needed)
+#   sudo apt install -y python3-opencv python3-picamera2 python3-gpiozero python3-lgpio python3-numpy
+#
+#   # MediaPipe via pip (not in apt)
+#   pip install mediapipe
+#
+# If you prefer a venv, use --system-site-packages so picamera2 is accessible:
+#   python -m venv --system-site-packages .venv
+#   source .venv/bin/activate
+#   pip install mediapipe
+
+mediapipe
+# The following are typically installed via apt on Raspberry Pi OS,
+# but are listed here for reference / non-Pi environments:
+# opencv-python
+# picamera2
+# gpiozero
+# lgpio
+# numpy
