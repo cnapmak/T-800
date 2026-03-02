@@ -22,3 +22,19 @@ openai>=1.0.0           # Whisper API for transcription
 
 # TTS handled by Piper binary (not a pip package)
 # Install Piper: https://github.com/rhasspy/piper
+
+# Servo control (NEW in v3)
+adafruit-circuitpython-servokit  # PCA9685 pan/tilt via adafruit-servokit
+
+# Web dashboard (NEW in v3)
+flask>=3.0.0            # HTTP server for dashboard UI
+flask-socketio>=5.3.0   # SocketIO server embedded in brain
+eventlet>=0.35.0        # Async WSGI server for flask-socketio
+
+# Terminal TUI (NEW in v3)
+rich>=13.0.0            # Rich terminal rendering
+python-socketio[client]>=5.10.0  # SocketIO client for t800_tui.py
+
+# Pi install command (use --break-system-packages on Bookworm):
+# pip3 install flask flask-socketio eventlet rich "python-socketio[client]" \
+#              adafruit-circuitpython-servokit --break-system-packages

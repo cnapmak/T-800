@@ -232,6 +232,16 @@ CONFIG = {
     "emotion_enabled": True,
     "emotion_smoothing_window": 3,
 
+    # Servo (pan/tilt gimbal via PCA9685)
+    "servo_enabled": True,
+    "servo_pan_ch":  0,
+    "servo_tilt_ch": 1,
+    "servo_address": 0x40,
+
+    # Dashboard (Flask + SocketIO)
+    "dashboard_enabled": True,
+    "dashboard_port": 5000,
+
     # Detection phrases
     "detection_phrases_known": [
         "Scanning complete. {name} identified. Welcome back.",
@@ -836,6 +846,80 @@ class FaceSystem:
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  Servo Controller -- pan/tilt gimbal (ported from face_tracker.py)
+# ═══════════════════════════════════════════════════════════════════
+class ServoController:
+    """Controls PCA9685 pan/tilt servos to track a detected face.
+
+    Gracefully disabled when hardware is absent (non-Pi environments).
+    """
+
+    KP        = 0.04   # proportional gain
+    DEAD_ZONE = 0.05   # normalised error below which we don't move
+
+    def __init__(self, config):
+        self.enabled = False
+        if not config.get("servo_enabled", True):
+            print("[SERVO] Disabled by config")
+            return
+        pan_ch  = config.get("servo_pan_ch",  0)
+        tilt_ch = config.get("servo_tilt_ch", 1)
+        addr    = config.get("servo_address",  0x40)
+        try:
+            from adafruit_servokit import ServoKit
+            self._kit     = ServoKit(channels=16, address=addr)
+            self._pan_ch  = pan_ch
+            self._tilt_ch = tilt_ch
+            self.pan_val  = 0.0   # -1.0 .. +1.0
+            self.tilt_val = 0.0
+            self._kit.servo[pan_ch].set_pulse_width_range(500, 2500)
+            self._kit.servo[tilt_ch].set_pulse_width_range(500, 2500)
+            self.center()
+            self.enabled = True
+            print(f"[SERVO] PCA9685 ready (pan=ch{pan_ch}, tilt=ch{tilt_ch})")
+        except Exception as e:
+            print(f"[SERVO] Unavailable (non-fatal): {e}")
+
+    @staticmethod
+    def _to_deg(v):
+        """Convert -1..+1 normalised value to 0..180 degrees."""
+        return (v + 1.0) * 90.0
+
+    def update(self, face_location, frame_size=(640, 480)):
+        """Drive servos toward face centre.
+
+        Args:
+            face_location: (top, right, bottom, left) pixel tuple from face_recognition.
+            frame_size:    (width, height) of the source frame.
+        """
+        if not self.enabled or face_location is None:
+            return
+        top, right, bottom, left = face_location
+        cx = (left + right) / 2
+        cy = (top  + bottom) / 2
+        ex = (cx / frame_size[0] - 0.5) * 2   # -1..+1, positive = right
+        ey = (cy / frame_size[1] - 0.5) * 2   # -1..+1, positive = down
+        if abs(ex) > self.DEAD_ZONE:
+            self.pan_val  = float(np.clip(self.pan_val  + self.KP * ex,  -1.0, 1.0))
+        if abs(ey) > self.DEAD_ZONE:
+            self.tilt_val = float(np.clip(self.tilt_val - self.KP * ey, -1.0, 1.0))
+        self._kit.servo[self._pan_ch].angle  = self._to_deg(self.pan_val)
+        self._kit.servo[self._tilt_ch].angle = self._to_deg(self.tilt_val)
+
+    def center(self):
+        """Return both servos to neutral (90°)."""
+        if not self.enabled:
+            return
+        self.pan_val = self.tilt_val = 0.0
+        self._kit.servo[self._pan_ch].angle  = 90.0
+        self._kit.servo[self._tilt_ch].angle = 90.0
+
+    def close(self):
+        """Centre servos on shutdown."""
+        self.center()
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  Speech Recognition (verbatim from v1)
 # ═══════════════════════════════════════════════════════════════════
 class SpeechSystem:
@@ -1306,6 +1390,252 @@ class OpenClawAI:
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  Dashboard HTML -- Terminator aesthetic
+# ═══════════════════════════════════════════════════════════════════
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>T-800 NEURAL NET</title>
+<style>
+  :root { --red: #ff2200; --dim: #aa1500; --bg: #000; --bg2: #0a0a0a; --border: #330000; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--red); font-family: 'Courier New', monospace;
+         font-size: 13px; height: 100vh; display: flex; flex-direction: column; padding: 8px; gap: 6px; }
+  h1 { font-size: 15px; letter-spacing: 4px; text-align: center; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  .grid { display: grid; grid-template-columns: 1fr 280px; gap: 6px; flex: 1; min-height: 0; }
+  .panel { background: var(--bg2); border: 1px solid var(--border); border-radius: 3px; padding: 8px; }
+  .label { font-size: 10px; letter-spacing: 2px; color: var(--dim); margin-bottom: 4px; }
+  .val { font-size: 22px; font-weight: bold; }
+  .val.sm { font-size: 15px; }
+  #feed { width: 100%; max-width: 640px; display: block; border: 1px solid var(--border); }
+  .feed-wrap { display: flex; justify-content: center; margin-bottom: 6px; }
+  .right { display: flex; flex-direction: column; gap: 6px; }
+  .speech { background: var(--bg2); border: 1px solid var(--border); border-radius: 3px; padding: 8px; }
+  .speech .label { margin-bottom: 2px; }
+  .speech .text { color: #ff6644; word-break: break-word; min-height: 36px; }
+  #log { background: var(--bg2); border: 1px solid var(--border); border-radius: 3px;
+         padding: 6px 8px; flex: 1; overflow-y: auto; font-size: 11px; color: #882200; }
+  #log .entry { border-bottom: 1px solid #110000; padding: 1px 0; }
+  #dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+         background: #880000; margin-right: 6px; transition: background 0.3s; }
+  #dot.on { background: var(--red); box-shadow: 0 0 6px var(--red); }
+  .state-badge { font-size: 18px; letter-spacing: 3px; padding: 4px 0; }
+  .disconnected { opacity: 0.4; }
+</style>
+</head>
+<body>
+<h1><span id="dot"></span>T-800 CYBERDYNE SYSTEMS — NEURAL NET TELEMETRY</h1>
+<div class="grid">
+  <div style="display:flex;flex-direction:column;gap:6px;">
+    <div class="feed-wrap"><img id="feed" src="/video_feed" alt="camera feed"></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;">
+      <div class="panel">
+        <div class="label">STATE</div>
+        <div id="state" class="val state-badge">IDLE</div>
+      </div>
+      <div class="panel">
+        <div class="label">IDENTITY</div>
+        <div id="identity" class="val sm">—</div>
+      </div>
+      <div class="panel">
+        <div class="label">EMOTION</div>
+        <div id="emotion" class="val sm">—</div>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">
+      <div class="speech">
+        <div class="label">HEARD</div>
+        <div id="heard" class="text">—</div>
+      </div>
+      <div class="speech">
+        <div class="label">SAID</div>
+        <div id="said" class="text">—</div>
+      </div>
+    </div>
+  </div>
+  <div class="right">
+    <div class="panel">
+      <div class="label">LIDAR RANGE</div>
+      <div id="lidar" class="val">— cm</div>
+      <div id="presence" class="val sm" style="margin-top:4px;">—</div>
+    </div>
+    <div id="log"></div>
+  </div>
+</div>
+<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+<script>
+  const MAX_LOG = 60;
+  const logEl   = document.getElementById('log');
+  const dot      = document.getElementById('dot');
+  let socket;
+  function connect() {
+    socket = io({ reconnectionDelay: 2000 });
+    socket.on('connect',    () => { dot.classList.add('on'); });
+    socket.on('disconnect', () => { dot.classList.remove('on'); setTimeout(connect, 3000); });
+    socket.on('state',   d => { document.getElementById('state').textContent = d.new; });
+    socket.on('face',    d => {
+      document.getElementById('identity').textContent = d.name  || '—';
+      document.getElementById('emotion').textContent  = d.emotion || '—';
+    });
+    socket.on('sensor',  d => {
+      document.getElementById('lidar').textContent    = d.present ? d.distance + ' cm' : '— cm';
+      document.getElementById('presence').textContent = d.present ? 'TARGET ACQUIRED' : 'NO TARGET';
+      document.getElementById('presence').style.color = d.present ? '#ff2200' : '#440000';
+    });
+    socket.on('speech_in',  d => { document.getElementById('heard').textContent = d.text || '—'; });
+    socket.on('speech_out', d => { document.getElementById('said').textContent  = d.text || '—'; });
+    socket.on('log', d => {
+      const e = document.createElement('div');
+      e.className = 'entry';
+      e.textContent = d.line;
+      logEl.appendChild(e);
+      while (logEl.children.length > MAX_LOG) logEl.removeChild(logEl.firstChild);
+      logEl.scrollTop = logEl.scrollHeight;
+    });
+  }
+  connect();
+</script>
+</body>
+</html>"""
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Dashboard Server -- Flask + SocketIO embedded as daemon thread
+# ═══════════════════════════════════════════════════════════════════
+class DashboardServer:
+    """Serves the live web dashboard on port 5000.
+
+    Runs as a daemon thread so the brain process owns everything.
+    MJPEG frames and SocketIO events are pushed from the main loop.
+    """
+
+    def __init__(self, config):
+        self._port    = config.get("dashboard_port", 5000)
+        self._enabled = False
+        self._frame_lock   = threading.Lock()
+        self._latest_frame = None
+        self.sio = None
+
+    def start(self):
+        try:
+            import eventlet
+            import eventlet.wsgi
+            from flask import Flask, Response, render_template_string
+            import flask_socketio as fio
+
+            app = Flask(__name__)
+            app.config["SECRET_KEY"] = "t800"
+            sio = fio.SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
+            self.sio = sio
+            self._app = app
+
+            frame_lock   = self._frame_lock
+            latest_frame = [None]   # mutable container so closure can update it
+
+            @app.route("/")
+            def index():
+                return render_template_string(DASHBOARD_HTML)
+
+            @app.route("/video_feed")
+            def video_feed():
+                def gen():
+                    while True:
+                        with frame_lock:
+                            f = latest_frame[0]
+                        if f is not None:
+                            ok, buf = cv2.imencode(
+                                ".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 70]
+                            )
+                            if ok:
+                                yield (
+                                    b"--frame\r\n"
+                                    b"Content-Type: image/jpeg\r\n\r\n"
+                                    + buf.tobytes()
+                                    + b"\r\n"
+                                )
+                        eventlet.sleep(0.05)
+                return Response(
+                    gen(), mimetype="multipart/x-mixed-replace; boundary=frame"
+                )
+
+            # Store reference so push_frame can write into the closure list
+            self._frame_ref = latest_frame
+
+            sock = eventlet.listen(("0.0.0.0", self._port))
+            t = threading.Thread(
+                target=eventlet.wsgi.server,
+                args=(sock, app),
+                kwargs={"log": open(os.devnull, "w")},
+                daemon=True,
+            )
+            t.start()
+            self._enabled = True
+            print(f"[DASH] Dashboard → http://0.0.0.0:{self._port}")
+        except Exception as e:
+            print(f"[DASH] Dashboard unavailable (non-fatal): {e}")
+
+    # ── Frame push ──────────────────────────────────────────────
+    def push_frame(self, frame):
+        if not self._enabled or frame is None or not hasattr(self, "_frame_ref"):
+            return
+        with self._frame_lock:
+            self._frame_ref[0] = frame.copy()
+
+    # ── SocketIO emit helpers ───────────────────────────────────
+    def _emit(self, event, data):
+        if self._enabled and self.sio is not None:
+            try:
+                self.sio.emit(event, data)
+            except Exception:
+                pass
+
+    def emit_state(self, old_state, new_state):
+        self._emit("state", {"old": old_state, "new": new_state})
+
+    def emit_face(self, name, emotion, face_loc=None):
+        self._emit("face", {
+            "name":     name or "—",
+            "emotion":  emotion or "—",
+            "face_loc": list(face_loc) if face_loc else None,
+        })
+
+    def emit_sensor(self, distance, present):
+        self._emit("sensor", {"distance": distance, "present": present})
+
+    def emit_speech_in(self, text):
+        self._emit("speech_in", {"text": text})
+
+    def emit_speech_out(self, text):
+        self._emit("speech_out", {"text": text})
+
+    def emit_log(self, line):
+        self._emit("log", {"line": line})
+
+
+# ── Log proxy: mirrors stdout to dashboard SocketIO ─────────────────
+class _LogProxy:
+    """Wraps sys.stdout so every print() also fires a dashboard log event."""
+
+    def __init__(self, real_stdout, dashboard):
+        self._real = real_stdout
+        self._dash = dashboard
+
+    def write(self, s):
+        self._real.write(s)
+        stripped = s.rstrip()
+        if stripped:
+            self._dash.emit_log(stripped)
+
+    def flush(self):
+        self._real.flush()
+
+    def fileno(self):
+        return self._real.fileno()
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  Main State Machine -- v2 with sticky identity & emotion
 # ═══════════════════════════════════════════════════════════════════
 class T800Brain:
@@ -1333,12 +1663,14 @@ class T800Brain:
         self._greeted_this_session = False
 
         # Initialize subsystems
-        self.lidar = LiDAR(config)
-        self.face = FaceSystem(config)
+        self.lidar  = LiDAR(config)
+        self.face   = FaceSystem(config)
         self.speech = SpeechSystem(config)
-        self.tts = TTSSystem(config)
-        self.ai = OpenClawAI(config)
-        self.leds = LEDMatrix(config)
+        self.tts    = TTSSystem(config)
+        self.ai     = OpenClawAI(config)
+        self.leds   = LEDMatrix(config)
+        self.servo  = ServoController(config)
+        self.dashboard = DashboardServer(config)
 
     def set_state(self, new_state):
         with self._state_lock:
@@ -1348,6 +1680,7 @@ class T800Brain:
             print(f"\n{'='*50}")
             print(f"  STATE: {old_state} -> {new_state}")
             print(f"{'='*50}")
+            self.dashboard.emit_state(old_state, new_state)
 
     def get_state(self):
         with self._state_lock:
@@ -1415,6 +1748,9 @@ class T800Brain:
         self.tts.start()
         self.ai.start()
         self.leds.start()
+        self.dashboard.start()
+        # Mirror stdout to dashboard log panel
+        sys.stdout = _LogProxy(sys.stdout, self.dashboard)
 
         print("\n[BOOT] All systems online.\n")
 
@@ -1432,6 +1768,7 @@ class T800Brain:
         self.lidar.stop()
         self.face.stop()
         self.speech.stop()
+        self.servo.close()
         print("[SHUTDOWN] Hasta la vista, baby.")
 
     # ── Main Loop ──────────────────────────────────────────────
@@ -1488,9 +1825,12 @@ class T800Brain:
         self._last_heard = None
         self._greeted_this_session = False
         self.face.reset_identity()
+        self.servo.center()
+        self.dashboard.emit_face(None, None)
 
         while self._running and self.get_state() == State.IDLE:
             status = self.lidar.get_status()
+            self.dashboard.emit_sensor(status["distance"], status["present"])
             if status["present"]:
                 self._last_presence_time = time.time()
                 self.set_state(State.DETECTED)
@@ -1521,6 +1861,9 @@ class T800Brain:
             if frame is not None and self.face._last_face_location:
                 self.face.detect_emotion(frame, self.face._last_face_location)
                 self._current_emotion = self.face.current_emotion
+                self.servo.update(self.face._last_face_location)
+                self.dashboard.push_frame(frame)
+            self.dashboard.emit_face(name, self._current_emotion, self.face._last_face_location)
             if self._greeted_this_session:
                 # Already greeted -- go straight to listening
                 self.set_state(State.LISTENING)
@@ -1540,6 +1883,12 @@ class T800Brain:
                 print(f"[FACE] Emotion: {self._current_emotion}")
         else:
             print("[FACE] Unknown individual detected")
+
+        # Aim servos at newly found face
+        self.servo.update(face_loc)
+        if frame is not None:
+            self.dashboard.push_frame(frame)
+        self.dashboard.emit_face(name, self._current_emotion, face_loc)
 
         self.set_state(State.GREETING)
 
@@ -1568,6 +1917,7 @@ class T800Brain:
         if self._current_emotion != "neutral":
             print(f"[GREET] Detected emotion: {self._current_emotion}")
 
+        self.dashboard.emit_speech_out(phrase)
         self.leds.animate_speaking()
         self._speak_safe(phrase)
         self._greeted_this_session = True
@@ -1602,11 +1952,20 @@ class T800Brain:
             if result["name"] is not None:
                 self._current_user = result["name"]
             self._current_emotion = result["emotion"]
+            # Track face with servo and push frame to dashboard
+            self.servo.update(result["face_location"])
+            self.dashboard.push_frame(frame)
+            self.dashboard.emit_face(
+                result["name"], result["emotion"], result["face_location"]
+            )
+        status = self.lidar.get_status()
+        self.dashboard.emit_sensor(status["distance"], status["present"])
 
         text = self.speech.listen_and_transcribe()
 
         if text:
             print(f"[MIC] Heard: \"{text}\"")
+            self.dashboard.emit_speech_in(text)
             self._last_heard = text
             self._conversation_count += 1
 
@@ -1669,6 +2028,7 @@ class T800Brain:
             print(f"[AI] User emotion: {self._current_emotion}")
         response = self.ai.get_response(text, context=context)
         print(f"[AI] Response: {response}")
+        self.dashboard.emit_speech_out(response)
 
         self._last_heard = None
 
