@@ -1284,6 +1284,17 @@ class OpenClawAI:
         env["HOME"] = _USER_HOME
         return env
 
+    def _load_soul(self):
+        """Load SOUL.md content for session priming."""
+        soul_path = os.path.join(
+            _USER_HOME, ".openclaw/workspace/agents", self.agent_id, "SOUL.md"
+        )
+        try:
+            with open(soul_path) as f:
+                return f.read().strip()
+        except Exception:
+            return ""
+
     def start(self):
         result = subprocess.run(
             ["which", self.cmd], capture_output=True,
@@ -1293,11 +1304,19 @@ class OpenClawAI:
             path = result.stdout.decode().strip()
             print(f"[AI] OpenClaw found at {path}")
             print(f"[AI] Using agent: {self.agent_id}")
+            # Prime the session with the T-800 persona from SOUL.md so the
+            # model adopts the correct personality from the very first turn.
+            soul = self._load_soul()
+            prime = (
+                f"{soul}\n\nInitialization complete. Stay in character for all"
+                " subsequent responses. Reply only with: Online."
+                if soul else "System check. Respond with: Online."
+            )
             try:
                 test = subprocess.run(
                     [self.cmd, "agent", "--agent", self.agent_id,
-                     "--message", "System check. Respond with: Online."],
-                    capture_output=True, text=True, timeout=30,
+                     "--message", prime],
+                    capture_output=True, text=True, timeout=45,
                     env=self._node_env
                 )
                 if test.returncode == 0:
