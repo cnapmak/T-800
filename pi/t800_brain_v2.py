@@ -953,11 +953,18 @@ class DisplaySystem:
         self._tilt_val  = 0.0
 
     def start(self):
-        # A missing DISPLAY causes Qt to SIGABRT the whole process — check first
+        # Missing or inaccessible DISPLAY makes Qt SIGABRT the whole process.
+        # Probe with xdpyinfo first — safe, no Qt involved.
         display = os.environ.get("DISPLAY", "") or os.environ.get("WAYLAND_DISPLAY", "")
         if not display:
-            print("[DISP] No DISPLAY env var — OpenCV window disabled (headless)")
-            print("[DISP]   Start with: sudo DISPLAY=:0 OPENAI_API_KEY=... python3 ~/t800_brain_v2.py")
+            print("[DISP] No DISPLAY — window disabled (headless/SSH)")
+            print("[DISP]   From Pi desktop: sudo -E python3 ~/t800_brain_v2.py")
+            return
+        probe = subprocess.run(["xdpyinfo"], capture_output=True,
+                               env={**os.environ, "DISPLAY": display})
+        if probe.returncode != 0:
+            print(f"[DISP] X display '{display}' not accessible")
+            print("[DISP]   Run: xhost +local:  then restart brain")
             return
         try:
             cv2.namedWindow("T-800 VISION", cv2.WINDOW_NORMAL)
