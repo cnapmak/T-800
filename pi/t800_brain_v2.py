@@ -953,8 +953,12 @@ class DisplaySystem:
         self._tilt_val  = 0.0
 
     def start(self):
-        import os
-        # Try to detect display — DISPLAY on Linux, or always try on Pi
+        # A missing DISPLAY causes Qt to SIGABRT the whole process — check first
+        display = os.environ.get("DISPLAY", "") or os.environ.get("WAYLAND_DISPLAY", "")
+        if not display:
+            print("[DISP] No DISPLAY env var — OpenCV window disabled (headless)")
+            print("[DISP]   Start with: sudo DISPLAY=:0 OPENAI_API_KEY=... python3 ~/t800_brain_v2.py")
+            return
         try:
             cv2.namedWindow("T-800 VISION", cv2.WINDOW_NORMAL)
             cv2.resizeWindow("T-800 VISION", 800, 500)
