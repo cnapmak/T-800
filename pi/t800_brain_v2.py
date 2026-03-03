@@ -954,16 +954,21 @@ class DisplaySystem:
 
     def start(self):
         # Missing or inaccessible DISPLAY makes Qt SIGABRT the whole process.
-        # Probe with xdpyinfo first — safe, no Qt involved.
+        # Probe via Unix socket — no external binary required.
         display = os.environ.get("DISPLAY", "") or os.environ.get("WAYLAND_DISPLAY", "")
         if not display:
             print("[DISP] No DISPLAY — window disabled (headless/SSH)")
             print("[DISP]   From Pi desktop: sudo -E python3 ~/t800_brain_v2.py")
             return
-        probe = subprocess.run(["xdpyinfo"], capture_output=True,
-                               env={**os.environ, "DISPLAY": display})
-        if probe.returncode != 0:
-            print(f"[DISP] X display '{display}' not accessible")
+        try:
+            import socket as _sock
+            disp_num = display.split(":")[-1].split(".")[0]
+            s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+            s.settimeout(1)
+            s.connect(f"/tmp/.X11-unix/X{disp_num}")
+            s.close()
+        except Exception as e:
+            print(f"[DISP] X display '{display}' not reachable: {e}")
             print("[DISP]   Run: xhost +local:  then restart brain")
             return
         try:
