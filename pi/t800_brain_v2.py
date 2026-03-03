@@ -920,6 +920,184 @@ class ServoController:
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  Display System -- OpenCV HUD (Terminator aesthetic)
+# ═══════════════════════════════════════════════════════════════════
+class DisplaySystem:
+    """Shows a live OpenCV window with face bounding box, state, and LiDAR HUD.
+
+    Mirrors the face_tracker.py visual style. Runs in a daemon thread.
+    Gracefully disabled when no display is available (headless SSH).
+    """
+
+    # HUD colours (BGR)
+    _RED   = (0,   30, 220)
+    _GREEN = (0,  200,  50)
+    _AMBER = (0,  160, 220)
+    _GRAY  = (120, 120, 120)
+    _WHITE = (220, 220, 220)
+
+    def __init__(self):
+        self.enabled  = False
+        self._thread  = None
+        self._stop    = threading.Event()
+        # Shared state updated by brain
+        self._lock      = threading.Lock()
+        self._frame     = None
+        self._face_loc  = None   # (top,right,bottom,left) or None
+        self._name      = None
+        self._emotion   = "neutral"
+        self._state     = "IDLE"
+        self._distance  = 0
+        self._present   = False
+        self._pan_val   = 0.0
+        self._tilt_val  = 0.0
+
+    def start(self):
+        import os
+        # Try to detect display — DISPLAY on Linux, or always try on Pi
+        try:
+            cv2.namedWindow("T-800 VISION", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("T-800 VISION", 800, 500)
+            self.enabled = True
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+            print("[DISP] OpenCV display started")
+        except Exception as e:
+            print(f"[DISP] Display unavailable (non-fatal): {e}")
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        if self.enabled:
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
+
+    def update(self, frame, face_loc, name, emotion, state,
+               distance, present, pan_val=0.0, tilt_val=0.0):
+        if not self.enabled or frame is None:
+            return
+        with self._lock:
+            self._frame    = frame.copy()
+            self._face_loc = face_loc
+            self._name     = name
+            self._emotion  = emotion or "neutral"
+            self._state    = state
+            self._distance = distance
+            self._present  = present
+            self._pan_val  = pan_val
+            self._tilt_val = tilt_val
+
+    def _draw(self, frame, face_loc, name, emotion, state,
+              distance, present, pan_val, tilt_val):
+        h, w = frame.shape[:2]
+        cx, cy = w // 2, h // 2
+
+        # ── Corner brackets ──────────────────────────────────────
+        b = 24
+        for bx, by, sx, sy in [(b, b, 1, 1), (w-b, b, -1, 1),
+                                (b, h-b, 1, -1), (w-b, h-b, -1, -1)]:
+            cv2.line(frame, (bx, by), (bx+sx*b, by),     self._GREEN, 2)
+            cv2.line(frame, (bx, by), (bx, by+sy*b),     self._GREEN, 2)
+
+        cv2.drawMarker(frame, (cx, cy), self._GREEN,
+                       cv2.MARKER_CROSS, 28, 1, cv2.LINE_AA)
+
+        # ── Face bounding box ─────────────────────────────────────
+        if face_loc:
+            top, right, bottom, left = face_loc
+            fx = (left + right) // 2
+            fy = (top  + bottom) // 2
+
+            # Corner markers
+            csz = 16
+            for px, py, dx, dy in [(left, top, 1, 1), (right, top, -1, 1),
+                                    (left, bottom, 1, -1), (right, bottom, -1, -1)]:
+                cv2.line(frame, (px, py), (px+dx*csz, py),  self._RED, 3)
+                cv2.line(frame, (px, py), (px, py+dy*csz),  self._RED, 3)
+
+            cv2.drawMarker(frame, (fx, fy), self._RED,
+                           cv2.MARKER_CROSS, 20, 2, cv2.LINE_AA)
+            cv2.line(frame, (cx, cy), (fx, fy), self._RED, 1, cv2.LINE_AA)
+
+            label = name.upper() if name and name != "Unknown" else "UNKNOWN"
+            if emotion and emotion != "neutral":
+                label += f"  [{emotion.upper()}]"
+            cv2.putText(frame, label, (left, max(top-10, 18)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, self._RED, 2, cv2.LINE_AA)
+            cv2.putText(frame, "TRACKING", (10, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, self._RED, 2, cv2.LINE_AA)
+        else:
+            cv2.putText(frame, "SCANNING", (10, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, self._AMBER, 2, cv2.LINE_AA)
+
+        # ── State badge (top-centre) ──────────────────────────────
+        state_col = {
+            "IDLE": self._GRAY, "DETECTED": self._AMBER,
+            "IDENTIFYING": self._AMBER, "GREETING": self._GREEN,
+            "LISTENING": self._GREEN, "PROCESSING": self._RED,
+            "SPEAKING": self._RED,
+        }.get(state, self._WHITE)
+        stxt = f"[ {state} ]"
+        (sw, _), _ = cv2.getTextSize(stxt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+        cv2.putText(frame, stxt, ((w-sw)//2, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, state_col, 2, cv2.LINE_AA)
+
+        # ── LiDAR (top-right) ─────────────────────────────────────
+        if present and distance > 0:
+            r_col = self._GREEN
+            r_txt = f"{distance/100:.2f} m"
+        else:
+            r_col = self._GRAY
+            r_txt = "-- m"
+        cv2.putText(frame, "RANGE", (w-130, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, r_col, 1, cv2.LINE_AA)
+        cv2.putText(frame, r_txt, (w-130, 52),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, r_col, 2, cv2.LINE_AA)
+
+        # ── Servo angles (bottom-left) ────────────────────────────
+        pan_deg  = (pan_val  + 1.0) * 90.0
+        tilt_deg = (tilt_val + 1.0) * 90.0
+        cv2.putText(frame, f"PAN  {pan_deg:5.1f}deg", (10, h-38),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, self._GREEN, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"TILT {tilt_deg:5.1f}deg", (10, h-18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, self._GREEN, 1, cv2.LINE_AA)
+
+        return frame
+
+    def _loop(self):
+        while not self._stop.is_set():
+            with self._lock:
+                if self._frame is None:
+                    time.sleep(0.033)
+                    continue
+                frame    = self._frame.copy()
+                face_loc = self._face_loc
+                name     = self._name
+                emotion  = self._emotion
+                state    = self._state
+                distance = self._distance
+                present  = self._present
+                pan_val  = self._pan_val
+                tilt_val = self._tilt_val
+
+            try:
+                vis = self._draw(frame, face_loc, name, emotion, state,
+                                 distance, present, pan_val, tilt_val)
+                cv2.imshow("T-800 VISION", vis)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+            except Exception as e:
+                print(f"[DISP] Error: {e}")
+                break
+
+            time.sleep(0.033)   # ~30fps
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  Speech Recognition (verbatim from v1)
 # ═══════════════════════════════════════════════════════════════════
 class SpeechSystem:
@@ -1728,11 +1906,12 @@ class T800Brain:
         self.tts    = TTSSystem(config)
         self.ai     = OpenClawAI(config)
         self.leds   = LEDMatrix(config)
-        self.servo  = ServoController(config)
+        self.servo     = ServoController(config)
+        self.display   = DisplaySystem()
         self.dashboard = DashboardServer(config)
         self.dashboard._brain_ref = self
         self._injected_text = None
-        self._inject_lock = threading.Lock()
+        self._inject_lock   = threading.Lock()
 
     def set_state(self, new_state):
         with self._state_lock:
@@ -1822,9 +2001,16 @@ class T800Brain:
         self.tts.start()
         self.ai.start()
         self.leds.start()
+        self.display.start()
         self.dashboard.start()
         # Mirror stdout to dashboard log panel
         sys.stdout = _LogProxy(sys.stdout, self.dashboard)
+
+        # Continuous servo + display update thread (~15 Hz)
+        self._tracking_thread = threading.Thread(
+            target=self._tracking_loop, daemon=True
+        )
+        self._tracking_thread.start()
 
         print("\n[BOOT] All systems online.\n")
 
@@ -1843,7 +2029,37 @@ class T800Brain:
         self.face.stop()
         self.speech.stop()
         self.servo.close()
+        self.display.stop()
         print("[SHUTDOWN] Hasta la vista, baby.")
+
+    def _tracking_loop(self):
+        """Continuous servo + display update at ~15 Hz, independent of state."""
+        while self._running:
+            state = self.get_state()
+            face_loc = self.face._last_face_location
+
+            # Update servos whenever we have a target (not idle)
+            if state != State.IDLE and face_loc is not None:
+                self.servo.update(face_loc)
+
+            # Capture a fresh frame for display
+            frame = self.face.capture_frame()
+            if frame is not None:
+                status = self.lidar.get_status()
+                self.display.update(
+                    frame, face_loc,
+                    self.face.current_identity,
+                    self.face.current_emotion,
+                    state,
+                    status["distance"],
+                    status["present"],
+                    self.servo.pan_val  if self.servo.enabled else 0.0,
+                    self.servo.tilt_val if self.servo.enabled else 0.0,
+                )
+                # Also push frame to web dashboard
+                self.dashboard.push_frame(frame)
+
+            time.sleep(0.067)   # ~15 Hz
 
     # ── Main Loop ──────────────────────────────────────────────
     def run(self):
