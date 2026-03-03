@@ -63,6 +63,8 @@ class T800State:
         self.heard      = "—"
         self.said       = "—"
         self.standby    = False
+        self.pan        = 0.0
+        self.tilt       = 0.0
         self.log        = deque(maxlen=MAX_LOG)
 
     def update(self, **kwargs):
@@ -86,6 +88,8 @@ class T800State:
                 "heard":     self.heard,
                 "said":      self.said,
                 "standby":   self.standby,
+                "pan":       self.pan,
+                "tilt":      self.tilt,
                 "log":       list(self.log),
             }
 
@@ -139,6 +143,15 @@ def make_layout(snap):
     lidar_panel = Panel(lidar_txt, title="[red]LIDAR[/]",
                         border_style=BORDER, box=box.HEAVY_HEAD)
 
+    # ── Servo panel ──────────────────────────────────────────────
+    pan_deg  = (snap["pan"]  + 1.0) * 90.0
+    tilt_deg = (snap["tilt"] + 1.0) * 90.0
+    servo_txt = Text()
+    servo_txt.append(f"PAN  {snap['pan']:+.2f}  ({pan_deg:.0f}\u00b0)\n", style=RED)
+    servo_txt.append(f"TILT {snap['tilt']:+.2f}  ({tilt_deg:.0f}\u00b0)",  style=DIM_RED)
+    servo_panel = Panel(servo_txt, title="[red]SERVO[/]",
+                        border_style=BORDER, box=box.HEAVY_HEAD)
+
     # ── Speech panels ─────────────────────────────────────────────
     heard_panel = Panel(
         Text(snap["heard"] or "—", style="bright_red"),
@@ -172,6 +185,7 @@ def make_layout(snap):
         Layout(state_panel,  name="state",   size=5),
         Layout(id_panel,     name="identity", size=7),
         Layout(lidar_panel,  name="lidar",   size=6),
+        Layout(servo_panel,  name="servo",   size=5),
     )
     layout["right"].split_column(
         Layout(heard_panel, name="heard", ratio=1),
@@ -225,6 +239,13 @@ def run_client(host, port, t8state):
     @sio.on("standby")
     def on_standby(data):
         t8state.update(standby=bool(data.get("active", False)))
+
+    @sio.on("servo")
+    def on_servo(data):
+        t8state.update(
+            pan =float(data.get("pan",  0.0)),
+            tilt=float(data.get("tilt", 0.0)),
+        )
 
     @sio.on("log")
     def on_log(data):

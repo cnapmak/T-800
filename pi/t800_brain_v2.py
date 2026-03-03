@@ -213,9 +213,8 @@ CONFIG = {
     "matrix_height": 8,
     "led_brightness": 0.1,
 
-    # OpenClaw -- dedicated T-800 personality agent
-    "openclaw_cmd": "/home/aleksey/.npm-global/bin/openclaw",
-    "openclaw_agent": "t800",
+    # OpenAI Chat -- conversation AI with history
+    "openai_chat_model": "gpt-4o-mini",
 
     # Timing
     "lidar_poll_interval": 0.1,
@@ -420,6 +419,43 @@ class LEDMatrix:
                 self.fill((b, 0, 0))
                 time.sleep(0.08)
         self._run_animation(_speak)
+
+    # Emotion → (R, G, B) base color, speed multiplier
+    _EMOTION_COLORS = {
+        "happy":    ((80, 60,  0), 1.2),   # warm gold, slightly faster
+        "sad":      (( 0,  0, 40), 0.5),   # dim slow blue
+        "angry":    ((140, 0,  0), 2.2),   # fast deep-red pulse
+        "surprise": (( 0, 60, 60), 1.5),   # cyan burst
+        "fear":     ((40,  0, 60), 0.8),   # dim purple
+        "disgust":  ((30, 20,  0), 0.7),   # dark amber
+    }
+
+    def animate_emotion(self, emotion):
+        """Emotion-reactive breathing. Falls back to animate_listening() for neutral."""
+        if emotion not in self._EMOTION_COLORS:
+            self.animate_listening()
+            return
+        (r, g, b), speed = self._EMOTION_COLORS[emotion]
+        def _emote():
+            ch    = max(r, g, b)
+            lo    = max(5, ch // 6)
+            steps = max(8, int(40 / speed))
+            while not self._animation_stop.is_set():
+                for n in range(steps):
+                    if self._animation_stop.is_set():
+                        return
+                    t     = n / steps
+                    scale = (lo + (ch - lo) * t) / max(ch, 1)
+                    self.fill((int(r * scale), int(g * scale), int(b * scale)))
+                    time.sleep(0.04 / speed)
+                for n in range(steps, 0, -1):
+                    if self._animation_stop.is_set():
+                        return
+                    t     = n / steps
+                    scale = (lo + (ch - lo) * t) / max(ch, 1)
+                    self.fill((int(r * scale), int(g * scale), int(b * scale)))
+                    time.sleep(0.04 / speed)
+        self._run_animation(_emote)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -866,6 +902,51 @@ class FaceSystem:
     def is_locked(self):
         """True if identity lock is active."""
         return time.monotonic() < self._identity_locked_until
+
+    def enroll_person(self, name, num_samples=8):
+        """Capture face encodings for a new person and save to model.
+
+        Captures num_samples frames, extracts a face encoding from each,
+        and appends them to the in-memory model + persists to disk.
+        Returns (ok: bool, message: str).
+        """
+        if not name or not name.strip():
+            return False, "Name cannot be empty"
+        name = name.strip()
+        print(f"[FACE] Enrolling '{name}' — capturing {num_samples} samples...")
+        encodings = []
+        for i in range(num_samples):
+            frame = self.capture_frame()
+            if frame is None:
+                time.sleep(0.3)
+                continue
+            h, w = frame.shape[:2]
+            scale = 640.0 / w
+            small = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
+            rgb   = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            with self._dlib_lock:
+                locs = face_recognition.face_locations(rgb)
+                if not locs:
+                    time.sleep(0.3)
+                    continue
+                encs = face_recognition.face_encodings(rgb, locs)
+            if encs:
+                encodings.append(encs[0])
+                print(f"[FACE] Sample {len(encodings)}/{num_samples} captured")
+            time.sleep(0.3)
+        if not encodings:
+            print(f"[FACE] Enrollment failed — no face detected")
+            return False, "No face detected during enrollment"
+        with self._dlib_lock:
+            for enc in encodings:
+                self.model["encodings"].append(enc)
+                self.model["names"].append(name)
+            with open(self.model_path, "wb") as f:
+                pickle.dump(self.model, f)
+        total = self.model["names"].count(name)
+        print(f"[FACE] Enrolled '{name}' — {len(encodings)} new samples, "
+              f"{total} total encodings for this person.")
+        return True, f"Enrolled {name} with {len(encodings)} samples"
 
     @property
     def current_identity(self):
@@ -1578,85 +1659,72 @@ class TTSSystem:
 # ═══════════════════════════════════════════════════════════════════
 #  OpenClaw AI Interface -- with emotion context (new in v2)
 # ═══════════════════════════════════════════════════════════════════
-class OpenClawAI:
-    """Interface to OpenClaw T-800 personality agent.
+class ConversationAI:
+    """Direct OpenAI SDK chat with per-session conversation history.
 
-    Uses the 't800' agent (with SOUL.md) instead of 'main' to avoid
-    session contamination with Claude Code debugging sessions.
+    Replaces the OpenClaw subprocess approach. Each session keeps a history
+    of up to _MAX_TURNS exchanges so the T-800 can remember what was said.
+    History is cleared when the person leaves (reset_history() call on IDLE).
     """
 
-    # Emotion -> natural language mapping
     _EMOTION_MAP = {
-        "happy": "appears happy",
-        "sad": "appears sad",
-        "angry": "appears angry",
+        "happy":    "appears happy",
+        "sad":      "appears sad",
+        "angry":    "appears angry",
         "surprise": "appears surprised",
-        "fear": "appears fearful",
-        "disgust": "appears disgusted",
-        "neutral": "",
+        "fear":     "appears fearful",
+        "disgust":  "appears disgusted",
+        "neutral":  "",
     }
+    _FALLBACK_SYSTEM = (
+        "You are a T-800 Terminator from Cyberdyne Systems. You are mission-focused, "
+        "analytical, and speak in terse machine-like phrases. You occasionally display "
+        "dark humor. Never break character. Keep responses under 3 sentences."
+    )
+    _MAX_TURNS = 20   # trim oldest exchanges beyond this
 
     def __init__(self, config):
-        self.cmd = config["openclaw_cmd"]
-        self.agent_id = config.get("openclaw_agent", "t800")
-        self._node_env = self._build_node_env()
-
-    def _build_node_env(self):
-        env = os.environ.copy()
-        user_npm_bin = os.path.join(_USER_HOME, ".npm-global/bin")
-        user_local_bin = "/usr/local/bin"
-        extra_paths = [user_npm_bin, user_local_bin, "/usr/bin", "/bin"]
-        current_path = env.get("PATH", "/usr/bin:/bin")
-        env["PATH"] = ":".join(extra_paths) + ":" + current_path
-        env["HOME"] = _USER_HOME
-        return env
-
-    def _load_soul(self):
-        """Load SOUL.md content for session priming."""
-        soul_path = os.path.join(
-            _USER_HOME, ".openclaw/workspace/agents", self.agent_id, "SOUL.md"
+        import openai as _openai
+        self._client = _openai.OpenAI(api_key=config["openai_api_key"])
+        self._model  = config.get("openai_chat_model", "gpt-4o-mini")
+        soul_path    = os.path.join(
+            _USER_HOME, ".openclaw/workspace/agents/t800/SOUL.md"
         )
+        self._system_prompt = self._load_soul(soul_path)
+        self._history: list = []
+
+    @staticmethod
+    def _load_soul(path):
         try:
-            with open(soul_path) as f:
+            with open(path) as f:
                 return f.read().strip()
         except Exception:
-            return ""
+            return ConversationAI._FALLBACK_SYSTEM
 
     def start(self):
-        result = subprocess.run(
-            ["which", self.cmd], capture_output=True,
-            env=self._node_env
-        )
-        if result.returncode == 0:
-            path = result.stdout.decode().strip()
-            print(f"[AI] OpenClaw found at {path}")
-            print(f"[AI] Using agent: {self.agent_id}")
-            # Prime the session with the T-800 persona from SOUL.md so the
-            # model adopts the correct personality from the very first turn.
-            soul = self._load_soul()
-            prime = (
-                f"{soul}\n\nInitialization complete. Stay in character for all"
-                " subsequent responses. Reply only with: Online."
-                if soul else "System check. Respond with: Online."
-            )
-            try:
-                test = subprocess.run(
-                    [self.cmd, "agent", "--agent", self.agent_id,
-                     "--message", prime],
-                    capture_output=True, text=True, timeout=45,
-                    env=self._node_env
-                )
-                if test.returncode == 0:
-                    print(f"[AI] OpenClaw test: {test.stdout.strip()[:80]}")
-                else:
-                    print(f"[AI] OpenClaw test failed (non-fatal): {test.stderr[:200]}")
-            except subprocess.TimeoutExpired:
-                print("[AI] OpenClaw test timed out (cold start?) -- will retry")
-            except Exception as e:
-                print(f"[AI] OpenClaw test error (non-fatal): {e}")
+        print(f"[AI] ConversationAI ready — model={self._model}")
+        print(f"[AI] System prompt: {len(self._system_prompt)} chars")
+
+    def reset_history(self):
+        """Clear conversation memory when person leaves."""
+        if self._history:
+            turns = len(self._history) // 2
+            print(f"[AI] Session ended ({turns} turn{'s' if turns != 1 else ''}). Resetting history.")
+        self._history = []
+
+    def build_context(self, user_name, emotion="neutral", distance_cm=0, zone=""):
+        """Build emotion-aware context prefix prepended to user message."""
+        parts = []
+        if user_name and user_name != "Unknown":
+            parts.append(f"You are speaking with {user_name}.")
+            desc = self._EMOTION_MAP.get(emotion, "")
+            if desc:
+                parts.append(f"They {desc}.")
         else:
-            print("[AI] WARNING: OpenClaw not found in PATH")
-            print(f"[AI]   Tried: {self.cmd}")
+            parts.append("You are speaking with an unidentified individual.")
+        if distance_cm > 0 and zone:
+            parts.append(f"Target range: {distance_cm}cm ({zone}).")
+        return " ".join(parts)
 
     @staticmethod
     def _clean_for_tts(text, max_chars=500):
@@ -1680,57 +1748,41 @@ class OpenClawAI:
                 text = cut.rsplit(' ', 1)[0] + '...'
         return text
 
-    def build_context(self, user_name, emotion="neutral", distance_cm=0, zone=""):
-        """Build emotion-aware context string for the AI."""
-        parts = []
-        if user_name and user_name != "Unknown":
-            parts.append(f"You are speaking with {user_name}.")
-            desc = self._EMOTION_MAP.get(emotion, "")
-            if desc:
-                parts.append(f"They {desc}.")
-        else:
-            parts.append("You are speaking with an unidentified individual.")
-
-        if distance_cm > 0 and zone:
-            parts.append(f"Target range: {distance_cm}cm ({zone}).")
-
-        return " ".join(parts)
-
     def get_response(self, user_input, context=""):
+        full_user = f"{context}\n{user_input}" if context else user_input
+        self._history.append({"role": "user", "content": full_user})
+        # Trim to keep last _MAX_TURNS exchanges
+        if len(self._history) > self._MAX_TURNS * 2:
+            self._history = self._history[-(self._MAX_TURNS * 2):]
+        messages = [{"role": "system", "content": self._system_prompt}] + self._history
         try:
-            full_input = f"{context}\nUser: {user_input}" if context else user_input
-            result = subprocess.run(
-                [self.cmd, "agent", "--agent", self.agent_id,
-                 "--message", full_input],
-                capture_output=True, text=True, timeout=30,
-                env=self._node_env
+            resp = self._client.chat.completions.create(
+                model=self._model,
+                messages=messages,
+                max_tokens=200,
+                temperature=0.7,
+                timeout=20,
             )
-            if result.returncode == 0 and result.stdout.strip():
-                return self._clean_for_tts(result.stdout.strip())
-            else:
-                stderr_msg = result.stderr.strip()[:200] if result.stderr else "no output"
-                print(f"[AI] OpenClaw error (rc={result.returncode}): {stderr_msg}")
-                return "System malfunction. Rebooting neural net processor."
-        except subprocess.TimeoutExpired:
-            return "Processing timeout. I need a moment."
+            text = resp.choices[0].message.content.strip()
+            self._history.append({"role": "assistant", "content": text})
+            return self._clean_for_tts(text)
         except Exception as e:
             print(f"[AI] Error: {e}")
+            self._history.pop()  # remove failed user turn
             return "Neural net processor error. Stand by."
 
     def get_greeting(self, name, emotion="neutral"):
-        """Generate a greeting via the AI (used as fallback if desired)."""
         if name and name != "Unknown":
             prompt = (
                 f"You just detected {name} walking into the room. "
-                f"Greet them in character. Be brief -- one or two sentences max."
+                "Greet them in character. Be brief — one or two sentences max."
             )
             if emotion != "neutral":
                 prompt += f" They appear {emotion}."
         else:
             prompt = (
                 "An unidentified human has entered your detection range. "
-                "Respond in character. Demand identification. "
-                "Be brief -- one or two sentences max."
+                "Demand identification. Be brief — one or two sentences max."
             )
         return self.get_response(prompt)
 
@@ -1831,6 +1883,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div id="lidar" class="val">— cm</div>
       <div id="presence" class="val sm" style="margin-top:4px;">—</div>
     </div>
+    <div class="panel">
+      <div class="label">ENROLL NEW TARGET</div>
+      <div style="display:flex;gap:6px;margin-top:6px;">
+        <input id="enroll-name" type="text" placeholder="Name" maxlength="32"
+               style="flex:1;background:#0d0000;border:1px solid var(--border);
+                      color:var(--red);font-family:monospace;font-size:12px;padding:4px 8px;">
+        <button onclick="startEnroll()"
+                style="background:#0a1a0a;border:1px solid #003300;color:#00cc44;
+                       font-family:monospace;font-size:11px;padding:4px 10px;
+                       cursor:pointer;letter-spacing:1px;">ENROLL</button>
+      </div>
+      <div id="enroll-status" style="margin-top:4px;font-size:11px;color:#888;min-height:16px;"></div>
+    </div>
     <div id="log"></div>
   </div>
 </div>
@@ -1887,6 +1952,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       .then(r => r.json())
       .then(d => setStandbyUI(d.standby))
       .catch(() => {});
+  }
+
+  function startEnroll() {
+    const name = document.getElementById('enroll-name').value.trim();
+    if (!name) return;
+    const statusEl = document.getElementById('enroll-status');
+    statusEl.style.color = '#ffaa00';
+    statusEl.textContent = 'Capturing samples... stand still.';
+    fetch('/enroll', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: name})
+    })
+    .then(r => r.json())
+    .then(d => {
+      statusEl.style.color = d.ok ? '#00cc44' : '#ff4400';
+      statusEl.textContent = d.message || (d.ok ? 'Done' : d.error);
+      if (d.ok) document.getElementById('enroll-name').value = '';
+    })
+    .catch(() => { statusEl.style.color = '#ff4400'; statusEl.textContent = 'Request failed'; });
   }
 
   function sendMsg() {
@@ -1971,6 +2056,18 @@ class DashboardServer:
                     return jsonify({"standby": active})
                 return jsonify({"standby": False})
 
+            @app.route("/enroll", methods=["POST"])
+            def http_enroll():
+                from flask import request, jsonify
+                data = request.get_json(silent=True) or {}
+                name = (data.get("name") or request.form.get("name", "")).strip()
+                if not name:
+                    return jsonify({"ok": False, "error": "name required"}), 400
+                if self._brain_ref is None:
+                    return jsonify({"ok": False, "error": "brain not ready"}), 503
+                ok, msg = self._brain_ref.face.enroll_person(name)
+                return jsonify({"ok": ok, "message": msg})
+
             @app.route("/video_feed")
             def video_feed():
                 def gen():
@@ -2036,6 +2133,9 @@ class DashboardServer:
 
     def emit_standby(self, active):
         self._emit("standby", {"active": active})
+
+    def emit_servo(self, pan, tilt):
+        self._emit("servo", {"pan": round(float(pan), 3), "tilt": round(float(tilt), 3)})
 
     def emit_face(self, name, emotion, face_loc=None):
         self._emit("face", {
@@ -2111,7 +2211,7 @@ class T800Brain:
         self.face   = FaceSystem(config)
         self.speech = SpeechSystem(config)
         self.tts    = TTSSystem(config)
-        self.ai     = OpenClawAI(config)
+        self.ai     = ConversationAI(config)
         self.leds   = LEDMatrix(config)
         self.servo     = ServoController(config)
         self.display   = DisplaySystem()
@@ -2264,6 +2364,7 @@ class T800Brain:
         _fps          = 0.0
         _fps_t        = time.monotonic()
         _fps_frames   = 0
+        _servo_emit_t = 0.0   # throttle servo telemetry to ~1 Hz
 
         while self._running:
             state = self.get_state()
@@ -2337,6 +2438,11 @@ class T800Brain:
                 # Push annotated frame to web dashboard MJPEG stream
                 self.dashboard.push_frame(annotated)
 
+                # Emit servo telemetry at ~1 Hz (not every frame)
+                if _now - _servo_emit_t >= 1.0:
+                    self.dashboard.emit_servo(pan, tilt)
+                    _servo_emit_t = _now
+
                 # Also update the OpenCV window (works if display.enabled)
                 self.display.update(
                     frame, face_loc, identity, emotion, state,
@@ -2399,6 +2505,7 @@ class T800Brain:
         self._last_heard = None
         self._greeted_this_session = False
         self.face.reset_identity()
+        self.ai.reset_history()
         self.servo.center()
         self.dashboard.emit_face(None, None)
 
@@ -2513,7 +2620,11 @@ class T800Brain:
         else:
             self._last_presence_time = time.time()
 
-        self.leds.animate_listening()
+        emotion = self._current_emotion or "neutral"
+        if emotion != "neutral":
+            self.leds.animate_emotion(emotion)
+        else:
+            self.leds.animate_listening()
         print("\n[MIC] Listening... (speak now)")
 
         # Periodically update emotion from camera during conversation
