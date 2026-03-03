@@ -191,9 +191,9 @@ CONFIG = {
     "lidar_lost_count": 5,             # consecutive readings to confirm absence
 
     # Camera
-    "camera_resolution": (640, 480),
+    "camera_resolution": (1920, 1080),
     "face_model_path": os.path.join(_USER_HOME, "face_model.pkl"),
-    "recognition_tolerance": 0.6,
+    "recognition_tolerance": 0.7,
 
     # Microphone
     "mic_device_index": _USB_MIC_INDEX,
@@ -545,6 +545,8 @@ class FaceSystem:
         self._recognition_lock = threading.Lock()
         self._recognition_in_progress = False
         self._last_recognition_time = 0.0
+        # dlib is not thread-safe; serialize all face_recognition calls
+        self._dlib_lock = threading.Lock()
 
         # Emotion detection
         self._emotion_detector = None
@@ -604,13 +606,18 @@ class FaceSystem:
     def _recognize_worker(self, frame):
         """Background thread: runs face_recognition (2-5s on Pi 5)."""
         try:
-            small = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
-            locations = face_recognition.face_locations(small)
+            # Downscale to ~640 wide for face recognition (works for any resolution)
+            h, w = frame.shape[:2]
+            rec_scale = 640.0 / w
+            small = cv2.resize(frame, (0, 0), fx=rec_scale, fy=rec_scale)
+            with self._dlib_lock:
+                locations = face_recognition.face_locations(small)
 
             if not locations:
                 result = {"name": None, "face_location": None}
             else:
-                encodings = face_recognition.face_encodings(small, locations)
+                with self._dlib_lock:
+                    encodings = face_recognition.face_encodings(small, locations)
                 name = "Unknown"
                 best_location = locations[0]
 
@@ -631,9 +638,19 @@ class FaceSystem:
                             best_location = locations[i] if i < len(locations) else locations[0]
                             break
 
+                # Log distance when unknown
+                if name == "Unknown" and encodings:
+                    dists = face_recognition.face_distance(
+                        self.model["encodings"], encodings[0]
+                    )
+                    best_i = dists.argmin()
+                    print(f"[FACE] Async no match: best={self.model['names'][best_i]} "
+                          f"dist={dists[best_i]:.3f} tol={self.tolerance}")
                 # Scale back to full-frame coordinates
+                inv_scale = 1.0 / rec_scale
                 top, right, bottom, left = best_location
-                face_loc = (top * 2, right * 2, bottom * 2, left * 2)
+                face_loc = (int(top * inv_scale), int(right * inv_scale),
+                            int(bottom * inv_scale), int(left * inv_scale))
                 result = {"name": name, "face_location": face_loc}
 
         except Exception as e:
@@ -785,13 +802,18 @@ class FaceSystem:
                 time.sleep(self.poll_interval)
                 continue
 
-            small = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
-            locations = face_recognition.face_locations(small)
+            h, w = frame.shape[:2]
+            blk_scale = 640.0 / w
+            small = cv2.resize(frame, (0, 0), fx=blk_scale, fy=blk_scale)
+            with self._dlib_lock:
+                locations = face_recognition.face_locations(small)
             if not locations:
                 time.sleep(self.poll_interval)
                 continue
 
-            encodings = face_recognition.face_encodings(small, locations)
+            with self._dlib_lock:
+                encodings = face_recognition.face_encodings(small, locations)
+            inv_blk = 1.0 / blk_scale
             for i, encoding in enumerate(encodings):
                 if not self.model["encodings"]:
                     return "Unknown", locations[0], frame
@@ -806,9 +828,10 @@ class FaceSystem:
                     )
                     best = distances.argmin()
                     if matches[best]:
-                        # Scale face location back
+                        # Scale face location back to full frame
                         top, right, bottom, left = locations[i]
-                        face_loc = (top * 2, right * 2, bottom * 2, left * 2)
+                        face_loc = (int(top * inv_blk), int(right * inv_blk),
+                                    int(bottom * inv_blk), int(left * inv_blk))
                         name = self.model["names"][best]
                         # Set sticky identity
                         self._current_identity = name
@@ -818,8 +841,16 @@ class FaceSystem:
                         self.detect_emotion(frame, face_loc)
                         return name, face_loc, frame
 
-            return "Unknown", (locations[0][0]*2, locations[0][1]*2,
-                               locations[0][2]*2, locations[0][3]*2), frame
+            # Log distance for debugging
+            distances = face_recognition.face_distance(
+                self.model["encodings"], encodings[0]
+            )
+            best = distances.argmin()
+            print(f"[FACE] No match: best={self.model['names'][best]} "
+                  f"dist={distances[best]:.3f} (tolerance={self.tolerance})")
+            t0, r0, b0, l0 = locations[0]
+            return "Unknown", (int(t0*inv_blk), int(r0*inv_blk),
+                               int(b0*inv_blk), int(l0*inv_blk)), frame
 
         return "Unknown", None, None
 
@@ -854,8 +885,11 @@ class ServoController:
     Gracefully disabled when hardware is absent (non-Pi environments).
     """
 
-    KP        = 0.08   # proportional gain (increased for more visible movement)
+    KP        = 0.04   # proportional gain (same as face_tracker.py)
     DEAD_ZONE = 0.04   # normalised error below which we don't move
+    # Safe angle range — keeps servo away from mechanical stops that cause whirring
+    ANGLE_MIN = 20.0
+    ANGLE_MAX = 160.0
 
     def __init__(self, config):
         self.enabled = False
@@ -880,13 +914,27 @@ class ServoController:
         except Exception as e:
             print(f"[SERVO] Unavailable (non-fatal): {e}")
 
+    def _write(self, pan_deg, tilt_deg):
+        """Write clamped angles to both servos."""
+        pan_deg  = float(np.clip(pan_deg,  self.ANGLE_MIN, self.ANGLE_MAX))
+        tilt_deg = float(np.clip(tilt_deg, self.ANGLE_MIN, self.ANGLE_MAX))
+        self._kit.servo[self._pan_ch].angle  = pan_deg
+        self._kit.servo[self._tilt_ch].angle = tilt_deg
+
     @staticmethod
     def _to_deg(v):
         """Convert -1..+1 normalised value to 0..180 degrees."""
         return (v + 1.0) * 90.0
 
+    def release(self):
+        """Stop sending PWM — servo relaxes, no longer fights mechanical stop."""
+        if not self.enabled:
+            return
+        self._kit.servo[self._pan_ch].angle  = None
+        self._kit.servo[self._tilt_ch].angle = None
+
     def update(self, face_location, frame_size=(640, 480)):
-        """Drive servos toward face centre.
+        """Drive servos toward face centre (pure P control, same as face_tracker.py).
 
         Args:
             face_location: (top, right, bottom, left) pixel tuple from face_recognition.
@@ -899,15 +947,15 @@ class ServoController:
         cy = (top  + bottom) / 2
         ex = (cx / frame_size[0] - 0.5) * 2   # -1..+1, positive = right
         ey = (cy / frame_size[1] - 0.5) * 2   # -1..+1, positive = down
+
         moved = False
         if abs(ex) > self.DEAD_ZONE:
             self.pan_val  = float(np.clip(self.pan_val  + self.KP * ex,  -1.0, 1.0))
             moved = True
         if abs(ey) > self.DEAD_ZONE:
-            self.tilt_val = float(np.clip(self.tilt_val - self.KP * ey, -1.0, 1.0))
+            self.tilt_val = float(np.clip(self.tilt_val + self.KP * ey, -1.0, 1.0))
             moved = True
-        self._kit.servo[self._pan_ch].angle  = self._to_deg(self.pan_val)
-        self._kit.servo[self._tilt_ch].angle = self._to_deg(self.tilt_val)
+        self._write(self._to_deg(self.pan_val), self._to_deg(self.tilt_val))
         if moved:
             print(f"[SERVO] pan={self.pan_val:+.2f} ({self._to_deg(self.pan_val):.0f}°) "
                   f"tilt={self.tilt_val:+.2f} ({self._to_deg(self.tilt_val):.0f}°) "
@@ -918,11 +966,10 @@ class ServoController:
         if not self.enabled:
             return
         self.pan_val = self.tilt_val = 0.0
-        self._kit.servo[self._pan_ch].angle  = 90.0
-        self._kit.servo[self._tilt_ch].angle = 90.0
+        self._write(90.0, 90.0)
 
     def close(self):
-        """Centre servos on shutdown."""
+        """Centre then release servos on shutdown."""
         self.center()
 
 
@@ -1665,25 +1712,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>T-800 NEURAL NET</title>
 <style>
-  :root { --red: #ff2200; --dim: #aa1500; --bg: #000; --bg2: #0a0a0a; --border: #330000; }
+  :root { --red: #ff2200; --dim: #aa1500; --bg: #000; --bg2: #0a0a0a; --border: #330000; --text: #d0d0d0; --text-dim: #888; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--red); font-family: 'Courier New', monospace;
          font-size: 13px; height: 100vh; display: flex; flex-direction: column; padding: 8px; gap: 6px; }
-  h1 { font-size: 15px; letter-spacing: 4px; text-align: center; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h1 { font-size: 15px; letter-spacing: 4px; text-align: center; border-bottom: 1px solid var(--border);
+       padding-bottom: 6px; display: flex; align-items: center; justify-content: center; gap: 12px; }
   .grid { display: grid; grid-template-columns: 1fr 280px; gap: 6px; flex: 1; min-height: 0; }
   .panel { background: var(--bg2); border: 1px solid var(--border); border-radius: 3px; padding: 8px; }
   .label { font-size: 10px; letter-spacing: 2px; color: var(--dim); margin-bottom: 4px; }
   .val { font-size: 22px; font-weight: bold; }
-  .val.sm { font-size: 15px; }
+  .val.sm { font-size: 15px; color: var(--text); }
   #feed { width: 100%; max-width: 640px; display: block; border: 1px solid var(--border); }
   .feed-wrap { display: flex; justify-content: center; margin-bottom: 6px; }
   .right { display: flex; flex-direction: column; gap: 6px; }
   .speech { background: var(--bg2); border: 1px solid var(--border); border-radius: 3px; padding: 8px; }
   .speech .label { margin-bottom: 2px; }
-  .speech .text { color: #ff6644; word-break: break-word; min-height: 36px; }
+  .speech .text { color: var(--text); word-break: break-word; min-height: 36px; }
   #log { background: var(--bg2); border: 1px solid var(--border); border-radius: 3px;
-         padding: 6px 8px; flex: 1; overflow-y: auto; font-size: 11px; color: #882200; }
-  #log .entry { border-bottom: 1px solid #110000; padding: 1px 0; }
+         padding: 6px 8px; flex: 1; overflow-y: auto; font-size: 11px; color: var(--text); }
+  #log .entry { border-bottom: 1px solid #1a1a1a; padding: 2px 0; }
   #dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
          background: #880000; margin-right: 6px; transition: background 0.3s; }
   #dot.on { background: var(--red); box-shadow: 0 0 6px var(--red); }
@@ -1691,17 +1739,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .disconnected { opacity: 0.4; }
   .msg-bar { display: flex; gap: 6px; }
   #msginput { flex: 1; background: #0a0a0a; border: 1px solid var(--border);
-              color: var(--red); font-family: 'Courier New', monospace;
+              color: var(--text); font-family: 'Courier New', monospace;
               font-size: 13px; padding: 6px 8px; outline: none; }
-  #msginput::placeholder { color: #440000; }
+  #msginput::placeholder { color: #555; }
   #msgsend { background: #1a0000; border: 1px solid var(--border); color: var(--red);
              font-family: 'Courier New', monospace; font-size: 12px; padding: 6px 12px;
              cursor: pointer; letter-spacing: 2px; }
   #msgsend:hover { background: #330000; }
+  /* Power button */
+  #pwrbtn { background: #0a1a0a; border: 1px solid #003300; color: #00cc44;
+            font-family: 'Courier New', monospace; font-size: 11px; padding: 3px 10px;
+            cursor: pointer; letter-spacing: 2px; border-radius: 3px; transition: all 0.2s; }
+  #pwrbtn:hover { background: #003300; }
+  #pwrbtn.standby { background: #1a0a00; border-color: #552200; color: #ff6600; }
+  #pwrbtn.standby:hover { background: #330000; }
 </style>
 </head>
 <body>
-<h1><span id="dot"></span>T-800 CYBERDYNE SYSTEMS — NEURAL NET TELEMETRY</h1>
+<h1>
+  <span><span id="dot"></span>T-800 CYBERDYNE SYSTEMS — NEURAL NET TELEMETRY</span>
+  <button id="pwrbtn" onclick="togglePower()" title="Toggle T-800 standby">&#9646;&#9646; STANDBY</button>
+</h1>
 <div class="grid">
   <div style="display:flex;flex-direction:column;gap:6px;">
     <div class="feed-wrap"><img id="feed" src="/video_feed" alt="camera feed"></div>
@@ -1746,22 +1804,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
 <script>
   const MAX_LOG = 60;
-  const logEl   = document.getElementById('log');
-  const dot      = document.getElementById('dot');
+  const logEl  = document.getElementById('log');
+  const dot    = document.getElementById('dot');
+  const pwrBtn = document.getElementById('pwrbtn');
   let socket;
+  let isStandby = false;
+
   function connect() {
     socket = io({ reconnectionDelay: 2000 });
     socket.on('connect',    () => { dot.classList.add('on'); });
     socket.on('disconnect', () => { dot.classList.remove('on'); setTimeout(connect, 3000); });
     socket.on('state',   d => { document.getElementById('state').textContent = d.new; });
+    socket.on('standby', d => { setStandbyUI(d.active); });
     socket.on('face',    d => {
-      document.getElementById('identity').textContent = d.name  || '—';
+      document.getElementById('identity').textContent = d.name    || '—';
       document.getElementById('emotion').textContent  = d.emotion || '—';
     });
     socket.on('sensor',  d => {
       document.getElementById('lidar').textContent    = d.present ? d.distance + ' cm' : '— cm';
       document.getElementById('presence').textContent = d.present ? 'TARGET ACQUIRED' : 'NO TARGET';
-      document.getElementById('presence').style.color = d.present ? '#ff2200' : '#440000';
+      document.getElementById('presence').style.color = d.present ? '#ff2200' : '#666';
     });
     socket.on('speech_in',  d => { document.getElementById('heard').textContent = d.text || '—'; });
     socket.on('speech_out', d => { document.getElementById('said').textContent  = d.text || '—'; });
@@ -1775,6 +1837,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     });
   }
   connect();
+
+  function setStandbyUI(active) {
+    isStandby = active;
+    if (active) {
+      pwrBtn.textContent = '▶ ACTIVATE';
+      pwrBtn.classList.add('standby');
+    } else {
+      pwrBtn.textContent = '⏸ STANDBY';
+      pwrBtn.classList.remove('standby');
+    }
+  }
+
+  function togglePower() {
+    fetch('/power', { method: 'POST' })
+      .then(r => r.json())
+      .then(d => setStandbyUI(d.standby))
+      .catch(() => {});
+  }
+
   function sendMsg() {
     const inp = document.getElementById('msginput');
     const txt = inp.value.trim();
@@ -1839,6 +1920,24 @@ class DashboardServer:
             def index():
                 return render_template_string(DASHBOARD_HTML)
 
+            @app.route("/inject", methods=["POST"])
+            def http_inject():
+                from flask import request, jsonify
+                data = request.get_json(silent=True) or {}
+                text = (data.get("text") or request.form.get("text") or "").strip()
+                if text and self._brain_ref is not None:
+                    self._brain_ref.inject_text(text)
+                    return jsonify({"ok": True, "text": text})
+                return jsonify({"ok": False, "error": "no text"}), 400
+
+            @app.route("/power", methods=["POST"])
+            def http_power():
+                from flask import jsonify
+                if self._brain_ref is not None:
+                    active = self._brain_ref.toggle_standby()
+                    return jsonify({"standby": active})
+                return jsonify({"standby": False})
+
             @app.route("/video_feed")
             def video_feed():
                 def gen():
@@ -1846,8 +1945,10 @@ class DashboardServer:
                         with frame_lock:
                             f = latest_frame[0]
                         if f is not None:
+                            # Downscale to 1280×720 for streaming (1080p is too large for MJPEG)
+                            stream = cv2.resize(f, (1280, 720)) if f.shape[1] > 1280 else f
                             ok, buf = cv2.imencode(
-                                ".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 70]
+                                ".jpg", stream, [cv2.IMWRITE_JPEG_QUALITY, 75]
                             )
                             if ok:
                                 yield (
@@ -1899,6 +2000,9 @@ class DashboardServer:
 
     def emit_state(self, old_state, new_state):
         self._emit("state", {"old": old_state, "new": new_state})
+
+    def emit_standby(self, active):
+        self._emit("standby", {"active": active})
 
     def emit_face(self, name, emotion, face_loc=None):
         self._emit("face", {
@@ -1967,6 +2071,7 @@ class T800Brain:
         self._last_heard = None
         self._detect_distance = 0
         self._greeted_this_session = False
+        self._standby = False   # when True: hold in IDLE, ignore presence
 
         # Initialize subsystems
         self.lidar  = LiDAR(config)
@@ -2001,6 +2106,19 @@ class T800Brain:
         with self._inject_lock:
             self._injected_text = text
         print(f"[DASH] Text injected: \"{text}\"")
+
+    def toggle_standby(self):
+        """Toggle standby mode. Returns True if now in standby."""
+        self._standby = not self._standby
+        if self._standby:
+            print("[DASH] T-800 entering STANDBY")
+            self.servo.center()
+            self.leds.off() if hasattr(self.leds, 'off') else None
+            self.set_state(State.IDLE)
+        else:
+            print("[DASH] T-800 ACTIVATED")
+        self.dashboard.emit_standby(self._standby)
+        return self._standby
 
     def _pop_injected_text(self):
         with self._inject_lock:
@@ -2104,16 +2222,62 @@ class T800Brain:
 
     def _tracking_loop(self):
         """Continuous servo + display update at ~15 Hz, independent of state."""
+        _fast_locs    = []    # HOG face locations (most recent successful detection)
+        _last_hog_t   = 0.0   # monotonic time of last successful HOG detection
+        _frame_skip   = 0     # skip counter for HOG (CPU budget)
+        _hog_scale    = 1.0   # scale used for the last HOG downscale
+        _HOG_TIMEOUT  = 0.5   # seconds — discard locs older than this
+
         while self._running:
             state = self.get_state()
-            face_loc = self.face._last_face_location
 
-            # Update servos whenever we have a target (not idle)
-            if state != State.IDLE and face_loc is not None:
-                self.servo.update(face_loc)
-
-            # Capture a fresh frame for display
+            # Capture a fresh frame for display + fast tracking
             frame = self.face.capture_frame()
+            face_loc = self.face._last_face_location  # fallback for HUD
+
+            if frame is not None and state != State.IDLE and self.servo.enabled:
+                # Run fast HOG face detection every 3rd frame (~5 Hz).
+                _frame_skip += 1
+                if _frame_skip >= 3:
+                    _frame_skip = 0
+                    h, w = frame.shape[:2]
+                    _hog_scale = 320.0 / w
+                    small = cv2.resize(frame, (0, 0), fx=_hog_scale, fy=_hog_scale)
+                    try:
+                        if self.face._dlib_lock.acquire(blocking=False):
+                            try:
+                                _fast_locs = face_recognition.face_locations(small, model="hog")
+                                # Timestamp fresh detections; clear if no face found
+                                if _fast_locs:
+                                    _last_hog_t = time.monotonic()
+                                else:
+                                    _last_hog_t = 0.0  # no face — stop servo
+                            finally:
+                                self.face._dlib_lock.release()
+                        else:
+                            # Lock busy (face_recognition encoding running).
+                            # Invalidate stale locs so the servo holds position
+                            # rather than chasing a ghost from 3-5 s ago.
+                            _fast_locs  = []
+                            _last_hog_t = 0.0
+                    except Exception:
+                        _fast_locs  = []
+                        _last_hog_t = 0.0
+
+                # Only drive the servo if the HOG detection is fresh enough
+                hog_age = time.monotonic() - _last_hog_t
+                if _fast_locs and hog_age < _HOG_TIMEOUT:
+                    inv = 1.0 / _hog_scale
+                    t, r, b, l = _fast_locs[0]
+                    live_loc = (int(t * inv), int(r * inv), int(b * inv), int(l * inv))
+                    h, w = frame.shape[:2]
+                    self.servo.update(live_loc, frame_size=(w, h))
+                    face_loc = live_loc   # also use for HUD
+                else:
+                    # No fresh face — release servo PWM so motor doesn't
+                    # fight against its mechanical stop (causes whirring).
+                    self.servo.release()
+
             if frame is not None:
                 status = self.lidar.get_status()
                 pan  = self.servo.pan_val  if self.servo.enabled else 0.0
@@ -2197,7 +2361,7 @@ class T800Brain:
         while self._running and self.get_state() == State.IDLE:
             status = self.lidar.get_status()
             self.dashboard.emit_sensor(status["distance"], status["present"])
-            if status["present"]:
+            if status["present"] and not self._standby:
                 self._last_presence_time = time.time()
                 self.set_state(State.DETECTED)
                 return
@@ -2227,7 +2391,6 @@ class T800Brain:
             if frame is not None and self.face._last_face_location:
                 self.face.detect_emotion(frame, self.face._last_face_location)
                 self._current_emotion = self.face.current_emotion
-                self.servo.update(self.face._last_face_location)
                 self.dashboard.push_frame(frame)
             self.dashboard.emit_face(name, self._current_emotion, self.face._last_face_location)
             if self._greeted_this_session:
@@ -2239,7 +2402,7 @@ class T800Brain:
 
         # No lock -- do full identification
         print("[FACE] Scanning for identification...")
-        name, face_loc, frame = self.face.identify_blocking(timeout=5.0)
+        name, face_loc, frame = self.face.identify_blocking(timeout=8.0)
         self._current_user = name
         self._current_emotion = self.face.current_emotion
 
@@ -2250,8 +2413,6 @@ class T800Brain:
         else:
             print("[FACE] Unknown individual detected")
 
-        # Aim servos at newly found face
-        self.servo.update(face_loc)
         if frame is not None:
             self.dashboard.push_frame(frame)
         self.dashboard.emit_face(name, self._current_emotion, face_loc)
@@ -2318,8 +2479,6 @@ class T800Brain:
             if result["name"] is not None:
                 self._current_user = result["name"]
             self._current_emotion = result["emotion"]
-            # Track face with servo and push frame to dashboard
-            self.servo.update(result["face_location"])
             self.dashboard.push_frame(frame)
             self.dashboard.emit_face(
                 result["name"], result["emotion"], result["face_location"]

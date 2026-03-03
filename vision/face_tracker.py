@@ -1,4 +1,11 @@
-#!/usr/bin/env python3
+#!/home/aleksey/t800_venv/bin/python3
+# If not running inside the venv (mediapipe missing), re-exec under the venv.
+import sys as _sys, os as _os
+_venv_dir = _os.path.expanduser("~/t800_venv")
+_venv_py  = _os.path.join(_venv_dir, "bin/python3")
+if (not _os.path.realpath(_sys.prefix).startswith(_os.path.realpath(_venv_dir))
+        and _os.path.exists(_venv_py)):
+    _os.execv(_venv_py, [_venv_py] + _sys.argv)
 """
 T-800 Vision System
 Face detection + pan/tilt servo tracking using:
@@ -239,9 +246,12 @@ class ServoController:
 
 # ── HUD ────────────────────────────────────────────────────────────────────────
 
+WHITE = (220, 220, 220)
+
 def draw_hud(frame: np.ndarray, dets: list[Det],
              dist_cm: int, strength: int, reliable: bool,
-             pan: float, tilt: float, servo_on: bool) -> None:
+             pan: float, tilt: float, servo_on: bool,
+             fps: float = 0.0) -> None:
     h, w = frame.shape[:2]
     cx, cy = w // 2, h // 2
 
@@ -285,12 +295,12 @@ def draw_hud(frame: np.ndarray, dets: list[Det],
         cv2.putText(frame, "SCANNING", (10, 38),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, AMBER, 2, cv2.LINE_AA)
 
-    # TF Mini panel (top-right)
+    # ── TF Mini panel (top-right) ──────────────────────────────────────────────
     if reliable:
         range_col = GREEN
         range_txt = "{:.2f} m".format(dist_cm / 100)
     elif dist_cm > 0:
-        range_col = AMBER                          # has a reading but out of range
+        range_col = AMBER
         range_txt = "{:.2f} m?".format(dist_cm / 100)
     else:
         range_col = GRAY
@@ -299,20 +309,39 @@ def draw_hud(frame: np.ndarray, dets: list[Det],
     cv2.putText(frame, "RANGE",    (w-130, 28),  cv2.FONT_HERSHEY_SIMPLEX, 0.55, range_col, 1, cv2.LINE_AA)
     cv2.putText(frame, range_txt,  (w-130, 58),  cv2.FONT_HERSHEY_SIMPLEX, 1.1,  range_col, 2, cv2.LINE_AA)
 
-    # Strength bar
+    # Signal strength bar
     bar_x, bar_y, bar_w, bar_hh = w-130, 68, 120, 6
     filled = int(bar_w * min(strength, 3000) / 3000)
     cv2.rectangle(frame, (bar_x, bar_y), (bar_x+bar_w, bar_y+bar_hh), (60, 60, 60), -1)
     if filled:
         cv2.rectangle(frame, (bar_x, bar_y), (bar_x+filled, bar_y+bar_hh), range_col, -1)
+    cv2.putText(frame, "STR {:d}".format(strength), (w-130, 88),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, range_col, 1, cv2.LINE_AA)
 
-    # ── Servo / controls ──────────────────────────────────────────────────────
-    sv = "PAN {:+.2f}  TILT {:+.2f}".format(pan, tilt) if servo_on else "SERVO: offline"
-    cv2.putText(frame, sv, (10, h-12), cv2.FONT_HERSHEY_SIMPLEX, 0.48, GREEN, 1, cv2.LINE_AA)
+    # ── FPS + resolution (top-left, below TRACKING/SCANNING) ─────────────────
+    cv2.putText(frame, "{:.1f} FPS  {}x{}".format(fps, w, h),
+                (10, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.45, WHITE, 1, cv2.LINE_AA)
 
+    # ── Detections count ──────────────────────────────────────────────────────
+    cv2.putText(frame, "FACES: {:d}".format(len(dets)),
+                (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.45, WHITE, 1, cv2.LINE_AA)
+
+    # ── Servo panel (bottom-left) ─────────────────────────────────────────────
+    if servo_on:
+        pan_deg  = (pan  + 1.0) * 90.0
+        tilt_deg = (tilt + 1.0) * 90.0
+        cv2.putText(frame, "PAN  {:+.2f}  ({:.0f} deg)".format(pan, pan_deg),
+                    (10, h-40), cv2.FONT_HERSHEY_SIMPLEX, 0.48, GREEN, 1, cv2.LINE_AA)
+        cv2.putText(frame, "TILT {:+.2f}  ({:.0f} deg)".format(tilt, tilt_deg),
+                    (10, h-22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, GREEN, 1, cv2.LINE_AA)
+    else:
+        cv2.putText(frame, "SERVO: offline",
+                    (10, h-22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, GRAY, 1, cv2.LINE_AA)
+
+    # ── Controls hint (bottom-right) ─────────────────────────────────────────
     ctrl = "q=quit   c=center"
     tw = cv2.getTextSize(ctrl, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0][0]
-    cv2.putText(frame, ctrl, (w-tw-10, h-12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, GREEN, 1, cv2.LINE_AA)
+    cv2.putText(frame, ctrl, (w-tw-10, h-12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, WHITE, 1, cv2.LINE_AA)
 
 
 # ── Main tracker ───────────────────────────────────────────────────────────────
@@ -385,6 +414,11 @@ class T800Vision:
 
         print("[T-800] Vision system online.  q=quit  c=center servos")
 
+        # FPS tracking
+        _fps        = 0.0
+        _fps_t      = time.time()
+        _fps_frames = 0
+
         try:
             while True:
                 # frame from picamera2 RGB888 = true RGB bytes
@@ -403,10 +437,18 @@ class T800Vision:
                 pan  = self.servos.pan_val  if self.servos else 0.0
                 tilt = self.servos.tilt_val if self.servos else 0.0
 
+                # FPS calculation (updated every second)
+                _fps_frames += 1
+                now = time.time()
+                if now - _fps_t >= 1.0:
+                    _fps    = _fps_frames / (now - _fps_t)
+                    _fps_t  = now
+                    _fps_frames = 0
+
                 # Convert RGB → BGR for OpenCV HUD drawing and display
                 frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
                 draw_hud(frame_bgr, dets, dist_cm, strength, reliable,
-                         pan, tilt, servo_on=self.servos is not None)
+                         pan, tilt, servo_on=self.servos is not None, fps=_fps)
                 cv2.imshow("T-800 Vision", frame_bgr)
 
                 key = cv2.waitKey(1) & 0xFF
