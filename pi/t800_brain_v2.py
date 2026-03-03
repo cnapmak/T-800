@@ -1442,6 +1442,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   #dot.on { background: var(--red); box-shadow: 0 0 6px var(--red); }
   .state-badge { font-size: 18px; letter-spacing: 3px; padding: 4px 0; }
   .disconnected { opacity: 0.4; }
+  .msg-bar { display: flex; gap: 6px; }
+  #msginput { flex: 1; background: #0a0a0a; border: 1px solid var(--border);
+              color: var(--red); font-family: 'Courier New', monospace;
+              font-size: 13px; padding: 6px 8px; outline: none; }
+  #msginput::placeholder { color: #440000; }
+  #msgsend { background: #1a0000; border: 1px solid var(--border); color: var(--red);
+             font-family: 'Courier New', monospace; font-size: 12px; padding: 6px 12px;
+             cursor: pointer; letter-spacing: 2px; }
+  #msgsend:hover { background: #330000; }
 </style>
 </head>
 <body>
@@ -1472,6 +1481,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="label">SAID</div>
         <div id="said" class="text">—</div>
       </div>
+    </div>
+    <div class="msg-bar">
+      <input id="msginput" type="text" placeholder="TYPE A MESSAGE TO THE T-800 AND PRESS ENTER">
+      <button id="msgsend" onclick="sendMsg()">SEND</button>
     </div>
   </div>
   <div class="right">
@@ -1515,6 +1528,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     });
   }
   connect();
+  function sendMsg() {
+    const inp = document.getElementById('msginput');
+    const txt = inp.value.trim();
+    if (!txt || !socket) return;
+    socket.emit('text_input', {text: txt});
+    document.getElementById('heard').textContent = txt;
+    inp.value = '';
+  }
+  document.addEventListener('DOMContentLoaded', () => {
+    document.getElementById('msginput').addEventListener('keydown', e => {
+      if (e.key === 'Enter') sendMsg();
+    });
+  });
 </script>
 </body>
 </html>"""
@@ -1536,6 +1562,7 @@ class DashboardServer:
         self._frame_lock   = threading.Lock()
         self._latest_frame = None
         self.sio = None
+        self._brain_ref = None   # set by T800Brain after construction
 
     def start(self):
         try:
@@ -1551,6 +1578,12 @@ class DashboardServer:
             )
             self.sio = sio
             self._app = app
+
+            @sio.on("text_input")
+            def on_text_input(data):
+                text = (data.get("text") or "").strip()
+                if text and self._brain_ref is not None:
+                    self._brain_ref.inject_text(text)
 
             frame_lock   = self._frame_lock
             latest_frame = [None]   # mutable container so closure can update it
@@ -1592,6 +1625,7 @@ class DashboardServer:
                     "port": self._port,
                     "use_reloader": False,
                     "log_output": False,
+                    "allow_unsafe_werkzeug": True,
                 },
                 daemon=True,
             )
@@ -1696,6 +1730,9 @@ class T800Brain:
         self.leds   = LEDMatrix(config)
         self.servo  = ServoController(config)
         self.dashboard = DashboardServer(config)
+        self.dashboard._brain_ref = self
+        self._injected_text = None
+        self._inject_lock = threading.Lock()
 
     def set_state(self, new_state):
         with self._state_lock:
@@ -1710,6 +1747,18 @@ class T800Brain:
     def get_state(self):
         with self._state_lock:
             return self.state
+
+    def inject_text(self, text):
+        """Inject a text message from the web dashboard as if it were spoken."""
+        with self._inject_lock:
+            self._injected_text = text
+        print(f"[DASH] Text injected: \"{text}\"")
+
+    def _pop_injected_text(self):
+        with self._inject_lock:
+            t = self._injected_text
+            self._injected_text = None
+        return t
 
     def _distance_zone(self, distance_cm):
         close_thresh = self.config.get("zone_close_cm", 80)
@@ -1986,7 +2035,13 @@ class T800Brain:
         status = self.lidar.get_status()
         self.dashboard.emit_sensor(status["distance"], status["present"])
 
-        text = self.speech.listen_and_transcribe()
+        # Check for text injected via web dashboard (takes priority over mic)
+        injected = self._pop_injected_text()
+        if injected:
+            text = injected
+            print(f"[DASH] Using injected text: \"{text}\"")
+        else:
+            text = self.speech.listen_and_transcribe()
 
         if text:
             print(f"[MIC] Heard: \"{text}\"")
