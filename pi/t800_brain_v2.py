@@ -1007,26 +1007,41 @@ class DisplaySystem:
                     os.environ["XAUTHORITY"] = xauth_path
                     print(f"[DISP] Using XAUTHORITY={xauth_path}")
                     break
-        try:
-            cv2.startWindowThread()  # enables imshow from background threads (Qt5)
-            cv2.namedWindow("T-800 VISION", cv2.WINDOW_NORMAL)
-            cv2.resizeWindow("T-800 VISION", 800, 500)
+        # Launch browser in kiosk mode on the Pi display (shows dashboard + annotated feed)
+        for browser in ("chromium-browser", "chromium", "firefox"):
+            try:
+                subprocess.Popen(
+                    [browser, "--kiosk", "--noerrdialogs",
+                     "--disable-infobars", "http://localhost:5000"],
+                    env={**os.environ, "DISPLAY": display,
+                         "XAUTHORITY": os.environ.get("XAUTHORITY", "")},
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                print(f"[DISP] Launched {browser} → http://localhost:5000")
+                self.enabled = True   # annotate() always works regardless
+                break
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                print(f"[DISP] Browser launch failed: {e}")
+                break
+        else:
+            print("[DISP] No browser found — open http://localhost:5000 manually")
             self.enabled = True
-            self._thread = threading.Thread(target=self._loop, daemon=True)
-            self._thread.start()
-            print("[DISP] OpenCV display started")
-        except Exception as e:
-            print(f"[DISP] Display unavailable (non-fatal): {e}")
+
+    def annotate(self, frame, face_loc, name, emotion, state,
+                 distance, present, pan_val=0.0, tilt_val=0.0):
+        """Draw HUD overlays and return the annotated frame (always works, no window needed)."""
+        if frame is None:
+            return frame
+        try:
+            return self._draw(frame.copy(), face_loc, name, emotion, state,
+                              distance, present, pan_val, tilt_val)
+        except Exception:
+            return frame
 
     def stop(self):
         self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=2)
-        if self.enabled:
-            try:
-                cv2.destroyAllWindows()
-            except Exception:
-                pass
 
     def update(self, frame, face_loc, name, emotion, state,
                distance, present, pan_val=0.0, tilt_val=0.0):
@@ -2100,18 +2115,24 @@ class T800Brain:
             frame = self.face.capture_frame()
             if frame is not None:
                 status = self.lidar.get_status()
-                self.display.update(
-                    frame, face_loc,
-                    self.face.current_identity,
-                    self.face.current_emotion,
-                    state,
-                    status["distance"],
-                    status["present"],
-                    self.servo.pan_val  if self.servo.enabled else 0.0,
-                    self.servo.tilt_val if self.servo.enabled else 0.0,
+                pan  = self.servo.pan_val  if self.servo.enabled else 0.0
+                tilt = self.servo.tilt_val if self.servo.enabled else 0.0
+                identity = self.face.current_identity
+                emotion  = self.face.current_emotion
+
+                # Draw HUD overlays on frame
+                annotated = self.display.annotate(
+                    frame, face_loc, identity, emotion, state,
+                    status["distance"], status["present"], pan, tilt,
                 )
-                # Also push frame to web dashboard
-                self.dashboard.push_frame(frame)
+                # Push annotated frame to web dashboard MJPEG stream
+                self.dashboard.push_frame(annotated)
+
+                # Also update the OpenCV window (works if display.enabled)
+                self.display.update(
+                    frame, face_loc, identity, emotion, state,
+                    status["distance"], status["present"], pan, tilt,
+                )
 
             time.sleep(0.067)   # ~15 Hz
 
