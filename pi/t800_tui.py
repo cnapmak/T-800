@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 T-800 Terminal TUI
 ==================
@@ -13,6 +14,18 @@ Usage:
 Requirements (install on the machine running THIS script):
     pip3 install rich python-socketio[client] --break-system-packages
 """
+
+import io
+import os
+import sys
+
+# Force UTF-8 output so Rich box-drawing characters render correctly
+# even on terminals that default to ASCII/Latin-1
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+else:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 import argparse
 import threading

@@ -1539,14 +1539,16 @@ class DashboardServer:
 
     def start(self):
         try:
-            import eventlet
-            import eventlet.wsgi
             from flask import Flask, Response, render_template_string
             import flask_socketio as fio
 
             app = Flask(__name__)
             app.config["SECRET_KEY"] = "t800"
-            sio = fio.SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
+            # threading mode: no monkey-patching needed, works in a daemon thread
+            sio = fio.SocketIO(
+                app, cors_allowed_origins="*", async_mode="threading",
+                logger=False, engineio_logger=False,
+            )
             self.sio = sio
             self._app = app
 
@@ -1574,7 +1576,7 @@ class DashboardServer:
                                     + buf.tobytes()
                                     + b"\r\n"
                                 )
-                        eventlet.sleep(0.05)
+                        time.sleep(0.05)
                 return Response(
                     gen(), mimetype="multipart/x-mixed-replace; boundary=frame"
                 )
@@ -1582,11 +1584,15 @@ class DashboardServer:
             # Store reference so push_frame can write into the closure list
             self._frame_ref = latest_frame
 
-            sock = eventlet.listen(("0.0.0.0", self._port))
             t = threading.Thread(
-                target=eventlet.wsgi.server,
-                args=(sock, app),
-                kwargs={"log": open(os.devnull, "w")},
+                target=sio.run,
+                args=(app,),
+                kwargs={
+                    "host": "0.0.0.0",
+                    "port": self._port,
+                    "use_reloader": False,
+                    "log_output": False,
+                },
                 daemon=True,
             )
             t.start()
