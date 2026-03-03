@@ -854,8 +854,8 @@ class ServoController:
     Gracefully disabled when hardware is absent (non-Pi environments).
     """
 
-    KP        = 0.04   # proportional gain
-    DEAD_ZONE = 0.05   # normalised error below which we don't move
+    KP        = 0.08   # proportional gain (increased for more visible movement)
+    DEAD_ZONE = 0.04   # normalised error below which we don't move
 
     def __init__(self, config):
         self.enabled = False
@@ -899,12 +899,19 @@ class ServoController:
         cy = (top  + bottom) / 2
         ex = (cx / frame_size[0] - 0.5) * 2   # -1..+1, positive = right
         ey = (cy / frame_size[1] - 0.5) * 2   # -1..+1, positive = down
+        moved = False
         if abs(ex) > self.DEAD_ZONE:
             self.pan_val  = float(np.clip(self.pan_val  + self.KP * ex,  -1.0, 1.0))
+            moved = True
         if abs(ey) > self.DEAD_ZONE:
             self.tilt_val = float(np.clip(self.tilt_val - self.KP * ey, -1.0, 1.0))
+            moved = True
         self._kit.servo[self._pan_ch].angle  = self._to_deg(self.pan_val)
         self._kit.servo[self._tilt_ch].angle = self._to_deg(self.tilt_val)
+        if moved:
+            print(f"[SERVO] pan={self.pan_val:+.2f} ({self._to_deg(self.pan_val):.0f}°) "
+                  f"tilt={self.tilt_val:+.2f} ({self._to_deg(self.tilt_val):.0f}°) "
+                  f"err=({ex:+.2f},{ey:+.2f})")
 
     def center(self):
         """Return both servos to neutral (90°)."""
@@ -955,13 +962,31 @@ class DisplaySystem:
     def start(self):
         # Missing or inaccessible DISPLAY makes Qt SIGABRT the whole process.
         # Probe via Unix socket — no external binary required.
+        import socket as _sock
+
         display = os.environ.get("DISPLAY", "") or os.environ.get("WAYLAND_DISPLAY", "")
+
+        # If DISPLAY not set (e.g. started via SSH with sudo), try :0 automatically
         if not display:
-            print("[DISP] No DISPLAY — window disabled (headless/SSH)")
-            print("[DISP]   From Pi desktop: sudo -E python3 ~/t800_brain_v2.py")
-            return
+            for candidate in (":0", ":0.0", ":1"):
+                num = candidate.split(":")[-1].split(".")[0]
+                try:
+                    s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+                    s.settimeout(1)
+                    s.connect(f"/tmp/.X11-unix/X{num}")
+                    s.close()
+                    display = candidate
+                    os.environ["DISPLAY"] = candidate
+                    print(f"[DISP] Auto-detected DISPLAY={candidate}")
+                    break
+                except Exception:
+                    pass
+            if not display:
+                print("[DISP] No X display found — window disabled (headless/SSH)")
+                return
+
+        # Verify the chosen display is reachable
         try:
-            import socket as _sock
             disp_num = display.split(":")[-1].split(".")[0]
             s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
             s.settimeout(1)
@@ -971,6 +996,17 @@ class DisplaySystem:
             print(f"[DISP] X display '{display}' not reachable: {e}")
             print("[DISP]   Run: xhost +local:  then restart brain")
             return
+        # Try to find the user's Xauthority file for root access
+        if os.geteuid() == 0 and not os.environ.get("XAUTHORITY"):
+            for xauth_path in (
+                "/home/aleksey/.Xauthority",
+                "/root/.Xauthority",
+                f"/run/user/1000/gdm/Xauthority",
+            ):
+                if os.path.exists(xauth_path):
+                    os.environ["XAUTHORITY"] = xauth_path
+                    print(f"[DISP] Using XAUTHORITY={xauth_path}")
+                    break
         try:
             cv2.namedWindow("T-800 VISION", cv2.WINDOW_NORMAL)
             cv2.resizeWindow("T-800 VISION", 800, 500)
@@ -2274,6 +2310,12 @@ class T800Brain:
             print(f"[DASH] Using injected text: \"{text}\"")
         else:
             text = self.speech.listen_and_transcribe()
+            # Also check if text was injected while mic was listening
+            # (mic returns None on silence/timeout — pick up any typed message)
+            if not text:
+                text = self._pop_injected_text()
+                if text:
+                    print(f"[DASH] Using injected text (post-mic): \"{text}\"")
 
         if text:
             print(f"[MIC] Heard: \"{text}\"")
