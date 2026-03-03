@@ -62,6 +62,7 @@ class T800State:
         self.present    = False
         self.heard      = "—"
         self.said       = "—"
+        self.standby    = False
         self.log        = deque(maxlen=MAX_LOG)
 
     def update(self, **kwargs):
@@ -84,6 +85,7 @@ class T800State:
                 "present":   self.present,
                 "heard":     self.heard,
                 "said":      self.said,
+                "standby":   self.standby,
                 "log":       list(self.log),
             }
 
@@ -100,6 +102,8 @@ def make_layout(snap):
                   style=HEADER)
     header.append("  ")
     header.append_text(conn_txt)
+    if snap.get("standby"):
+        header.append("  [ STANDBY ]", style="bold yellow")
 
     # ── State panel ──────────────────────────────────────────────
     state_color = {
@@ -149,7 +153,7 @@ def make_layout(snap):
     log_lines = snap["log"]
     log_txt = Text()
     for line in log_lines:
-        log_txt.append(line + "\n", style="dim red")
+        log_txt.append(line + "\n", style="bright_white")
     log_panel = Panel(log_txt, title="[red]LOG[/]",
                       border_style=BORDER, box=box.HEAVY_HEAD)
 
@@ -217,6 +221,10 @@ def run_client(host, port, t8state):
     @sio.on("speech_out")
     def on_speech_out(data):
         t8state.update(said=data.get("text", "—"))
+
+    @sio.on("standby")
+    def on_standby(data):
+        t8state.update(standby=bool(data.get("active", False)))
 
     @sio.on("log")
     def on_log(data):

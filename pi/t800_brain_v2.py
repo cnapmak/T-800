@@ -2113,7 +2113,8 @@ class T800Brain:
         if self._standby:
             print("[DASH] T-800 entering STANDBY")
             self.servo.center()
-            self.leds.off() if hasattr(self.leds, 'off') else None
+            self.leds.stop_animation()
+            self.leds.clear()
             self.set_state(State.IDLE)
         else:
             print("[DASH] T-800 ACTIVATED")
