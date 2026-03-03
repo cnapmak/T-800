@@ -1008,6 +1008,7 @@ class DisplaySystem:
                     print(f"[DISP] Using XAUTHORITY={xauth_path}")
                     break
         try:
+            cv2.startWindowThread()  # enables imshow from background threads (Qt5)
             cv2.namedWindow("T-800 VISION", cv2.WINDOW_NORMAL)
             cv2.resizeWindow("T-800 VISION", 800, 500)
             self.enabled = True
@@ -2058,19 +2059,20 @@ class T800Brain:
         # Mirror stdout to dashboard log panel
         sys.stdout = _LogProxy(sys.stdout, self.dashboard)
 
-        # Continuous servo + display update thread (~15 Hz)
-        self._tracking_thread = threading.Thread(
-            target=self._tracking_loop, daemon=True
-        )
-        self._tracking_thread.start()
-
         print("\n[BOOT] All systems online.\n")
 
         self.speech.pause_mic()
         self.tts.speak("T-800 online. Systems operational. Scanning for targets.")
         self.speech.resume_mic()
 
+        # Must be True before tracking loop starts (loop guards on this flag)
         self._running = True
+
+        # Continuous servo + display update thread (~15 Hz)
+        self._tracking_thread = threading.Thread(
+            target=self._tracking_loop, daemon=True
+        )
+        self._tracking_thread.start()
 
     def shutdown(self):
         print("\n[SHUTDOWN] Powering down...")
