@@ -1007,27 +1007,28 @@ class DisplaySystem:
                     os.environ["XAUTHORITY"] = xauth_path
                     print(f"[DISP] Using XAUTHORITY={xauth_path}")
                     break
-        # Launch browser in kiosk mode on the Pi display (shows dashboard + annotated feed)
-        for browser in ("chromium-browser", "chromium", "firefox"):
-            try:
-                subprocess.Popen(
-                    [browser, "--kiosk", "--noerrdialogs",
-                     "--disable-infobars", "http://localhost:5000"],
-                    env={**os.environ, "DISPLAY": display,
-                         "XAUTHORITY": os.environ.get("XAUTHORITY", "")},
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-                print(f"[DISP] Launched {browser} → http://localhost:5000")
-                self.enabled = True   # annotate() always works regardless
-                break
-            except FileNotFoundError:
-                continue
-            except Exception as e:
-                print(f"[DISP] Browser launch failed: {e}")
-                break
-        else:
-            print("[DISP] No browser found — open http://localhost:5000 manually")
+        # Launch the dedicated OpenCV viewer subprocess.
+        # It runs cv2.imshow on its OWN main thread (required by Qt5/X11)
+        # and reads the annotated MJPEG stream from the dashboard.
+        viewer = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "t800_viewer.py")
+        if not os.path.exists(viewer):
+            viewer = os.path.join(_USER_HOME, "T-800/pi/t800_viewer.py")
+        try:
+            env = {**os.environ,
+                   "DISPLAY": display,
+                   "XAUTHORITY": os.environ.get("XAUTHORITY", ""),
+                   "QT_QPA_PLATFORM": "xcb"}
+            subprocess.Popen(
+                [sys.executable, viewer, "http://localhost:5000"],
+                env=env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            print(f"[DISP] Viewer launched (http://localhost:5000/video_feed)")
             self.enabled = True
+        except Exception as e:
+            print(f"[DISP] Viewer launch failed: {e}")
+            self.enabled = True   # annotate() still works for web dashboard
 
     def annotate(self, frame, face_loc, name, emotion, state,
                  distance, present, pan_val=0.0, tilt_val=0.0):
