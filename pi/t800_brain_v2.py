@@ -956,10 +956,6 @@ class ServoController:
             self.tilt_val = float(np.clip(self.tilt_val + self.KP * ey, -1.0, 1.0))
             moved = True
         self._write(self._to_deg(self.pan_val), self._to_deg(self.tilt_val))
-        if moved:
-            print(f"[SERVO] pan={self.pan_val:+.2f} ({self._to_deg(self.pan_val):.0f}°) "
-                  f"tilt={self.tilt_val:+.2f} ({self._to_deg(self.tilt_val):.0f}°) "
-                  f"err=({ex:+.2f},{ey:+.2f})")
 
     def center(self):
         """Return both servos to neutral (90°)."""
@@ -1078,13 +1074,13 @@ class DisplaySystem:
             self.enabled = True   # annotate() still works for web dashboard
 
     def annotate(self, frame, face_loc, name, emotion, state,
-                 distance, present, pan_val=0.0, tilt_val=0.0):
+                 distance, present, pan_val=0.0, tilt_val=0.0, fps=0.0):
         """Draw HUD overlays and return the annotated frame (always works, no window needed)."""
         if frame is None:
             return frame
         try:
             return self._draw(frame.copy(), face_loc, name, emotion, state,
-                              distance, present, pan_val, tilt_val)
+                              distance, present, pan_val, tilt_val, fps)
         except Exception:
             return frame
 
@@ -1107,83 +1103,113 @@ class DisplaySystem:
             self._tilt_val = tilt_val
 
     def _draw(self, frame, face_loc, name, emotion, state,
-              distance, present, pan_val, tilt_val):
+              distance, present, pan_val, tilt_val, fps=0.0):
         h, w = frame.shape[:2]
         cx, cy = w // 2, h // 2
 
-        # ── Corner brackets ──────────────────────────────────────
-        b = 24
+        # ── Corner brackets (same style as face_tracker.py) ───────
+        b = 28
         for bx, by, sx, sy in [(b, b, 1, 1), (w-b, b, -1, 1),
                                 (b, h-b, 1, -1), (w-b, h-b, -1, -1)]:
-            cv2.line(frame, (bx, by), (bx+sx*b, by),     self._GREEN, 2)
-            cv2.line(frame, (bx, by), (bx, by+sy*b),     self._GREEN, 2)
-
+            cv2.line(frame, (bx, by), (bx+sx*b, by),  self._GREEN, 2)
+            cv2.line(frame, (bx, by), (bx, by+sy*b),  self._GREEN, 2)
         cv2.drawMarker(frame, (cx, cy), self._GREEN,
-                       cv2.MARKER_CROSS, 28, 1, cv2.LINE_AA)
+                       cv2.MARKER_CROSS, 32, 1, cv2.LINE_AA)
 
-        # ── Face bounding box ─────────────────────────────────────
+        # ── State colour map ──────────────────────────────────────
+        state_col = {
+            "IDLE":         self._GRAY,
+            "DETECTED":     self._AMBER,
+            "IDENTIFYING":  self._AMBER,
+            "GREETING":     self._GREEN,
+            "LISTENING":    self._GREEN,
+            "PROCESSING":   self._RED,
+            "SPEAKING":     self._RED,
+        }.get(state, self._WHITE)
+
+        # ── Face bounding box + target info ───────────────────────
         if face_loc:
             top, right, bottom, left = face_loc
             fx = (left + right) // 2
             fy = (top  + bottom) // 2
 
-            # Corner markers
+            # Full rectangle (like face_tracker.py)
+            cv2.rectangle(frame, (left, top), (right, bottom), self._RED, 1)
+
+            # Corner markers on top of rectangle
             csz = 16
             for px, py, dx, dy in [(left, top, 1, 1), (right, top, -1, 1),
                                     (left, bottom, 1, -1), (right, bottom, -1, -1)]:
-                cv2.line(frame, (px, py), (px+dx*csz, py),  self._RED, 3)
-                cv2.line(frame, (px, py), (px, py+dy*csz),  self._RED, 3)
+                cv2.line(frame, (px, py), (px+dx*csz, py), self._RED, 3)
+                cv2.line(frame, (px, py), (px, py+dy*csz), self._RED, 3)
 
             cv2.drawMarker(frame, (fx, fy), self._RED,
                            cv2.MARKER_CROSS, 20, 2, cv2.LINE_AA)
             cv2.line(frame, (cx, cy), (fx, fy), self._RED, 1, cv2.LINE_AA)
 
-            label = name.upper() if name and name != "Unknown" else "UNKNOWN"
+            # Label above box: "TARGET  ALEX [HAPPY]  |  1.23 m"
+            tgt = name.upper() if name and name != "Unknown" else "UNKNOWN"
             if emotion and emotion != "neutral":
-                label += f"  [{emotion.upper()}]"
-            cv2.putText(frame, label, (left, max(top-10, 18)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, self._RED, 2, cv2.LINE_AA)
-            cv2.putText(frame, "TRACKING", (10, 40),
+                tgt += f"  [{emotion.upper()}]"
+            if present and distance > 0:
+                tgt += f"  |  {distance/100:.2f} m"
+            cv2.putText(frame, tgt, (left, max(top-8, 18)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, self._RED, 2, cv2.LINE_AA)
+
+            cv2.putText(frame, f"TRACKING  [ {state} ]", (10, 38),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, self._RED, 2, cv2.LINE_AA)
         else:
-            cv2.putText(frame, "SCANNING", (10, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, self._AMBER, 2, cv2.LINE_AA)
+            cv2.putText(frame, f"SCANNING  [ {state} ]", (10, 38),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, state_col, 2, cv2.LINE_AA)
 
-        # ── State badge (top-centre) ──────────────────────────────
-        state_col = {
-            "IDLE": self._GRAY, "DETECTED": self._AMBER,
-            "IDENTIFYING": self._AMBER, "GREETING": self._GREEN,
-            "LISTENING": self._GREEN, "PROCESSING": self._RED,
-            "SPEAKING": self._RED,
-        }.get(state, self._WHITE)
-        stxt = f"[ {state} ]"
-        (sw, _), _ = cv2.getTextSize(stxt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
-        cv2.putText(frame, stxt, ((w-sw)//2, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, state_col, 2, cv2.LINE_AA)
+        # ── FPS + resolution (below TRACKING/SCANNING) ────────────
+        cv2.putText(frame, f"{fps:.1f} FPS  {w}x{h}",
+                    (10, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.45, self._WHITE, 1, cv2.LINE_AA)
 
-        # ── LiDAR (top-right) ─────────────────────────────────────
+        # ── LiDAR panel (top-right, same as face_tracker.py) ──────
         if present and distance > 0:
             r_col = self._GREEN
             r_txt = f"{distance/100:.2f} m"
         else:
             r_col = self._GRAY
             r_txt = "-- m"
-        cv2.putText(frame, "RANGE", (w-130, 28),
+        cv2.putText(frame, "RANGE",  (w-130, 28),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, r_col, 1, cv2.LINE_AA)
-        cv2.putText(frame, r_txt, (w-130, 52),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, r_col, 2, cv2.LINE_AA)
+        cv2.putText(frame, r_txt,    (w-130, 58),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.1, r_col, 2, cv2.LINE_AA)
 
-        # ── Servo angles (bottom-left) ────────────────────────────
+        # Presence bar (replaces strength bar — brain has no raw strength value)
+        bar_x, bar_y, bar_w, bar_h2 = w-130, 68, 120, 6
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x+bar_w, bar_y+bar_h2),
+                      (60, 60, 60), -1)
+        if present:
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x+bar_w, bar_y+bar_h2),
+                          r_col, -1)
+        presence_txt = "TARGET ACQUIRED" if present else "NO TARGET"
+        cv2.putText(frame, presence_txt, (w-130, 88),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, r_col, 1, cv2.LINE_AA)
+
+        # ── Servo angles (bottom-left, same as face_tracker.py) ───
         pan_deg  = (pan_val  + 1.0) * 90.0
         tilt_deg = (tilt_val + 1.0) * 90.0
-        cv2.putText(frame, f"PAN  {pan_deg:5.1f}deg", (10, h-38),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, self._GREEN, 1, cv2.LINE_AA)
-        cv2.putText(frame, f"TILT {tilt_deg:5.1f}deg", (10, h-18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, self._GREEN, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"PAN  {pan_val:+.2f}  ({pan_deg:.0f} deg)",
+                    (10, h-40), cv2.FONT_HERSHEY_SIMPLEX, 0.48, self._GREEN, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"TILT {tilt_val:+.2f}  ({tilt_deg:.0f} deg)",
+                    (10, h-22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, self._GREEN, 1, cv2.LINE_AA)
+
+        # ── Controls hint (bottom-right) ──────────────────────────
+        ctrl = "q=quit"
+        tw = cv2.getTextSize(ctrl, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0][0]
+        cv2.putText(frame, ctrl, (w-tw-10, h-12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, self._WHITE, 1, cv2.LINE_AA)
 
         return frame
 
     def _loop(self):
+        _fps        = 0.0
+        _fps_t      = time.monotonic()
+        _fps_frames = 0
+
         while not self._stop.is_set():
             with self._lock:
                 if self._frame is None:
@@ -1199,9 +1225,16 @@ class DisplaySystem:
                 pan_val  = self._pan_val
                 tilt_val = self._tilt_val
 
+            _fps_frames += 1
+            now = time.monotonic()
+            if now - _fps_t >= 1.0:
+                _fps    = _fps_frames / (now - _fps_t)
+                _fps_t  = now
+                _fps_frames = 0
+
             try:
                 vis = self._draw(frame, face_loc, name, emotion, state,
-                                 distance, present, pan_val, tilt_val)
+                                 distance, present, pan_val, tilt_val, _fps)
                 cv2.imshow("T-800 VISION", vis)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
@@ -2228,6 +2261,9 @@ class T800Brain:
         _frame_skip   = 0     # skip counter for HOG (CPU budget)
         _hog_scale    = 1.0   # scale used for the last HOG downscale
         _HOG_TIMEOUT  = 0.5   # seconds — discard locs older than this
+        _fps          = 0.0
+        _fps_t        = time.monotonic()
+        _fps_frames   = 0
 
         while self._running:
             state = self.get_state()
@@ -2279,6 +2315,13 @@ class T800Brain:
                     # fight against its mechanical stop (causes whirring).
                     self.servo.release()
 
+            _fps_frames += 1
+            _now = time.monotonic()
+            if _now - _fps_t >= 1.0:
+                _fps    = _fps_frames / (_now - _fps_t)
+                _fps_t  = _now
+                _fps_frames = 0
+
             if frame is not None:
                 status = self.lidar.get_status()
                 pan  = self.servo.pan_val  if self.servo.enabled else 0.0
@@ -2289,7 +2332,7 @@ class T800Brain:
                 # Draw HUD overlays on frame
                 annotated = self.display.annotate(
                     frame, face_loc, identity, emotion, state,
-                    status["distance"], status["present"], pan, tilt,
+                    status["distance"], status["present"], pan, tilt, _fps,
                 )
                 # Push annotated frame to web dashboard MJPEG stream
                 self.dashboard.push_frame(annotated)
