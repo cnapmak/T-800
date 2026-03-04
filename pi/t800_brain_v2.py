@@ -619,7 +619,7 @@ class FaceSystem:
         # Initialize camera
         self.camera = Picamera2()
         cam_config = self.camera.create_preview_configuration(
-            main={"size": self.resolution, "format": "RGB888"}
+            main={"size": self.resolution, "format": "BGR888"}
         )
         self.camera.configure(cam_config)
         self.camera.start()
@@ -656,6 +656,7 @@ class FaceSystem:
             h, w = frame.shape[:2]
             rec_scale = 640.0 / w
             small = cv2.resize(frame, (0, 0), fx=rec_scale, fy=rec_scale)
+            small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)  # face_recognition needs RGB
             with self._dlib_lock:
                 locations = face_recognition.face_locations(small)
 
@@ -851,6 +852,7 @@ class FaceSystem:
             h, w = frame.shape[:2]
             blk_scale = 640.0 / w
             small = cv2.resize(frame, (0, 0), fx=blk_scale, fy=blk_scale)
+            small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)  # face_recognition needs RGB
             with self._dlib_lock:
                 locations = face_recognition.face_locations(small)
             if not locations:
