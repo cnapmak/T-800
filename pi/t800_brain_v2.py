@@ -110,6 +110,16 @@ except ImportError:
     print("[BOOT] FER not installed -- emotion detection disabled")
     print("[BOOT]   Install with: pip3 install fer --break-system-packages")
 
+# MediaPipe for fast lock-free face detection in the tracking loop (optional)
+try:
+    import mediapipe as _mediapipe
+    _MP_FACE_DETECTION = _mediapipe.solutions.face_detection
+    _MP_AVAILABLE = True
+    print("[BOOT] MediaPipe available — using for servo tracking")
+except ImportError:
+    _MP_AVAILABLE = False
+    print("[BOOT] MediaPipe not found — servo tracking uses HOG (slower)")
+
 
 # ── Home directory (always /home/aleksey, even under sudo) ───────
 _USER_HOME = "/home/aleksey"
@@ -2355,66 +2365,102 @@ class T800Brain:
         print("[SHUTDOWN] Hasta la vista, baby.")
 
     def _tracking_loop(self):
-        """Continuous servo + display update at ~15 Hz, independent of state."""
-        _fast_locs    = []    # HOG face locations (most recent successful detection)
-        _last_hog_t   = 0.0   # monotonic time of last successful HOG detection
-        _frame_skip   = 0     # skip counter for HOG (CPU budget)
-        _hog_scale    = 1.0   # scale used for the last HOG downscale
-        _HOG_TIMEOUT  = 0.5   # seconds — discard locs older than this
+        """Continuous servo + display update at ~20 Hz, independent of state.
+
+        Uses MediaPipe for face detection when available (lock-free, runs every
+        frame at full rate). Falls back to dlib HOG when MediaPipe is absent.
+
+        MediaPipe advantage: completely independent of dlib, so face recognition
+        running concurrently (3-5 s) never blocks servo updates.
+        """
         _fps          = 0.0
         _fps_t        = time.monotonic()
         _fps_frames   = 0
         _servo_emit_t = 0.0   # throttle servo telemetry to ~1 Hz
+        _last_det_t   = 0.0   # time of most recent successful detection
+        _DET_TIMEOUT  = 1.5   # release servo after this many seconds without a face
+
+        # ── MediaPipe path ────────────────────────────────────────
+        if _MP_AVAILABLE:
+            _mp_det = _MP_FACE_DETECTION.FaceDetection(
+                model_selection=0, min_detection_confidence=0.3
+            )
+        else:
+            # HOG fallback state
+            _mp_det       = None
+            _fast_locs    = []
+            _last_hog_t   = 0.0
+            _frame_skip   = 0
+            _hog_scale    = 1.0
+            _HOG_TIMEOUT  = 4.0   # hold servo during face recognition (3-5 s)
 
         while self._running:
             state = self.get_state()
 
-            # Capture a fresh frame for display + fast tracking
+            # Capture a fresh frame for display + tracking
             frame = self.face.capture_frame()
             face_loc = self.face._last_face_location  # fallback for HUD
 
             if frame is not None and state != State.IDLE and self.servo.enabled:
-                # Run fast HOG face detection every 3rd frame (~5 Hz).
-                _frame_skip += 1
-                if _frame_skip >= 3:
-                    _frame_skip = 0
-                    h, w = frame.shape[:2]
-                    _hog_scale = 320.0 / w
-                    small = cv2.resize(frame, (0, 0), fx=_hog_scale, fy=_hog_scale)
-                    try:
-                        if self.face._dlib_lock.acquire(blocking=False):
-                            try:
-                                _fast_locs = face_recognition.face_locations(small, model="hog")
-                                # Timestamp fresh detections; clear if no face found
-                                if _fast_locs:
-                                    _last_hog_t = time.monotonic()
-                                else:
-                                    _last_hog_t = 0.0  # no face — stop servo
-                            finally:
-                                self.face._dlib_lock.release()
-                        else:
-                            # Lock busy (face_recognition encoding running).
-                            # Invalidate stale locs so the servo holds position
-                            # rather than chasing a ghost from 3-5 s ago.
+                h, w = frame.shape[:2]
+
+                if _mp_det is not None:
+                    # ── MediaPipe: every frame, no dlib lock ──────
+                    scale   = 640.0 / w
+                    small   = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
+                    rgb     = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+                    results = _mp_det.process(rgb)
+                    if results.detections:
+                        d  = results.detections[0]
+                        bb = d.location_data.relative_bounding_box
+                        sh, sw = small.shape[:2]
+                        left   = max(0, int(bb.xmin * sw))
+                        top    = max(0, int(bb.ymin * sh))
+                        right  = min(sw, int((bb.xmin + bb.width)  * sw))
+                        bottom = min(sh, int((bb.ymin + bb.height) * sh))
+                        # Scale back to full-frame coords
+                        inv = 1.0 / scale
+                        live_loc = (int(top*inv), int(right*inv),
+                                    int(bottom*inv), int(left*inv))
+                        self.servo.update(live_loc, frame_size=(w, h))
+                        face_loc    = live_loc
+                        _last_det_t = time.monotonic()
+                    else:
+                        if time.monotonic() - _last_det_t > _DET_TIMEOUT:
+                            self.servo.release()
+
+                else:
+                    # ── HOG fallback: every 3rd frame, shares dlib lock ──
+                    _frame_skip += 1
+                    if _frame_skip >= 3:
+                        _frame_skip = 0
+                        _hog_scale = 320.0 / w
+                        small = cv2.resize(frame, (0, 0), fx=_hog_scale, fy=_hog_scale)
+                        try:
+                            if self.face._dlib_lock.acquire(blocking=False):
+                                try:
+                                    _fast_locs = face_recognition.face_locations(
+                                        small, model="hog"
+                                    )
+                                    _last_hog_t = time.monotonic() if _fast_locs else 0.0
+                                finally:
+                                    self.face._dlib_lock.release()
+                            # lock busy → keep _fast_locs unchanged (hold position)
+                        except Exception:
                             _fast_locs  = []
                             _last_hog_t = 0.0
-                    except Exception:
-                        _fast_locs  = []
-                        _last_hog_t = 0.0
 
-                # Only drive the servo if the HOG detection is fresh enough
-                hog_age = time.monotonic() - _last_hog_t
-                if _fast_locs and hog_age < _HOG_TIMEOUT:
-                    inv = 1.0 / _hog_scale
-                    t, r, b, l = _fast_locs[0]
-                    live_loc = (int(t * inv), int(r * inv), int(b * inv), int(l * inv))
-                    h, w = frame.shape[:2]
-                    self.servo.update(live_loc, frame_size=(w, h))
-                    face_loc = live_loc   # also use for HUD
-                else:
-                    # No fresh face — release servo PWM so motor doesn't
-                    # fight against its mechanical stop (causes whirring).
-                    self.servo.release()
+                    hog_age = time.monotonic() - _last_hog_t
+                    if _fast_locs and hog_age < _HOG_TIMEOUT:
+                        inv = 1.0 / _hog_scale
+                        t, r, b, l = _fast_locs[0]
+                        live_loc = (int(t*inv), int(r*inv), int(b*inv), int(l*inv))
+                        self.servo.update(live_loc, frame_size=(w, h))
+                        face_loc    = live_loc
+                        _last_det_t = time.monotonic()
+                    else:
+                        if time.monotonic() - _last_det_t > _DET_TIMEOUT:
+                            self.servo.release()
 
             _fps_frames += 1
             _now = time.monotonic()
@@ -2449,7 +2495,7 @@ class T800Brain:
                     status["distance"], status["present"], pan, tilt,
                 )
 
-            time.sleep(0.067)   # ~15 Hz
+            time.sleep(0.05)    # ~20 Hz (MediaPipe fast enough; HOG still benefits)
 
     # ── Main Loop ──────────────────────────────────────────────
     def run(self):
