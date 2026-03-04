@@ -201,7 +201,7 @@ CONFIG = {
     "lidar_lost_count": 5,             # consecutive readings to confirm absence
 
     # Camera
-    "camera_resolution": (1920, 1080),
+    "camera_resolution": (1280, 720),
     "face_model_path": os.path.join(_USER_HOME, "face_model.pkl"),
     "recognition_tolerance": 0.7,
 
@@ -619,7 +619,7 @@ class FaceSystem:
         # Initialize camera
         self.camera = Picamera2()
         cam_config = self.camera.create_preview_configuration(
-            main={"size": self.resolution, "format": "BGR888"}
+            main={"size": self.resolution, "format": "RGB888"}
         )
         self.camera.configure(cam_config)
         self.camera.start()
@@ -656,7 +656,6 @@ class FaceSystem:
             h, w = frame.shape[:2]
             rec_scale = 640.0 / w
             small = cv2.resize(frame, (0, 0), fx=rec_scale, fy=rec_scale)
-            small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)  # face_recognition needs RGB
             with self._dlib_lock:
                 locations = face_recognition.face_locations(small)
 
@@ -852,7 +851,6 @@ class FaceSystem:
             h, w = frame.shape[:2]
             blk_scale = 640.0 / w
             small = cv2.resize(frame, (0, 0), fx=blk_scale, fy=blk_scale)
-            small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)  # face_recognition needs RGB
             with self._dlib_lock:
                 locations = face_recognition.face_locations(small)
             if not locations:
@@ -2087,10 +2085,8 @@ class DashboardServer:
                         with frame_lock:
                             f = latest_frame[0]
                         if f is not None:
-                            # Downscale to 1280×720 for streaming (1080p is too large for MJPEG)
-                            stream = cv2.resize(f, (1280, 720)) if f.shape[1] > 1280 else f
                             ok, buf = cv2.imencode(
-                                ".jpg", stream, [cv2.IMWRITE_JPEG_QUALITY, 75]
+                                ".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 75]
                             )
                             if ok:
                                 yield (

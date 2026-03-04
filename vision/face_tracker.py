@@ -348,10 +348,9 @@ def draw_hud(frame: np.ndarray, dets: list[Det],
 
 class T800Vision:
     def __init__(self, args: argparse.Namespace):
-        # Camera — RGB888 so picamera2 gives us true RGB bytes.
-        # We convert to BGR once at display time; MediaPipe receives RGB directly.
+        # Use preview configuration — on Pi 5/PiSP this correctly converts to RGB888.
         self.cam = Picamera2()
-        self.cam.configure(self.cam.create_video_configuration(
+        self.cam.configure(self.cam.create_preview_configuration(
             main={"format": "RGB888", "size": (FRAME_WIDTH, FRAME_HEIGHT)},
             controls={"FrameRate": FPS},
         ))
@@ -421,9 +420,9 @@ class T800Vision:
 
         try:
             while True:
-                # frame from picamera2 RGB888 = true RGB bytes
+                # Picamera2 RGB888 delivers BGR bytes on Pi — native for OpenCV
                 frame_rgb = self.cam.capture_array()
-                dets      = self._detect(frame_rgb)   # MediaPipe expects RGB
+                dets      = self._detect(cv2.cvtColor(frame_rgb, cv2.COLOR_BGR2RGB))
 
                 # Servo tracking
                 if dets and self.servos:
@@ -445,8 +444,8 @@ class T800Vision:
                     _fps_t  = now
                     _fps_frames = 0
 
-                # Convert RGB → BGR for OpenCV HUD drawing and display
-                frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                # frame_rgb is already BGR from camera — use directly for OpenCV
+                frame_bgr = frame_rgb
                 draw_hud(frame_bgr, dets, dist_cm, strength, reliable,
                          pan, tilt, servo_on=self.servos is not None, fps=_fps)
                 cv2.imshow("T-800 Vision", frame_bgr)
