@@ -207,8 +207,8 @@ CONFIG = {
 
     # Microphone
     "mic_device_index": _USB_MIC_INDEX,
-    "listen_timeout": 8,
-    "phrase_time_limit": 15,
+    "listen_timeout": 10,
+    "phrase_time_limit": 60,
 
     # TTS
     "piper_binary": "/usr/local/bin/piper",
@@ -223,8 +223,14 @@ CONFIG = {
     "matrix_height": 8,
     "led_brightness": 0.1,
 
-    # OpenAI Chat -- conversation AI with history
-    "openai_chat_model": "gpt-4o-mini",
+    # OpenAI (Whisper STT only — chat now uses Anthropic)
+    "openai_chat_model": "gpt-4o-mini",   # kept for reference, unused
+
+    # Anthropic (Claude) — dual-agent AI
+    "anthropic_api_key":  os.environ.get("ANTHROPIC_API_KEY", ""),
+    "agent_mode":         "quick",        # "quick" | "full"  (boot default)
+    "personality":        "terminator",   # boot-default personality name
+    "personalities_dir":  os.path.join(_USER_HOME, "Desktop/T-800/personalities"),
 
     # Timing
     "lidar_poll_interval": 0.1,
@@ -1667,118 +1673,120 @@ class TTSSystem:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  OpenClaw AI Interface -- with emotion context (new in v2)
+#  Dual-Agent AI System
+#  QuickAI  — Claude Haiku, no tools, ~1-2s response
+#  ClaudeAgentAI — Claude Sonnet, full tool use (shell, files, robot)
+#  AgentManager  — wrapper that switches between the two
 # ═══════════════════════════════════════════════════════════════════
-class ConversationAI:
-    """Direct OpenAI SDK chat with per-session conversation history.
 
-    Replaces the OpenClaw subprocess approach. Each session keeps a history
-    of up to _MAX_TURNS exchanges so the T-800 can remember what was said.
-    History is cleared when the person leaves (reset_history() call on IDLE).
-    """
+_FALLBACK_SYSTEM = (
+    "You are a T-800 Terminator from Cyberdyne Systems. You are mission-focused, "
+    "analytical, and speak in terse machine-like phrases. You occasionally display "
+    "dark humor. Never break character. Keep responses under 3 sentences."
+)
 
-    _EMOTION_MAP = {
-        "happy":    "appears happy",
-        "sad":      "appears sad",
-        "angry":    "appears angry",
-        "surprise": "appears surprised",
-        "fear":     "appears fearful",
-        "disgust":  "appears disgusted",
-        "neutral":  "",
-    }
-    _FALLBACK_SYSTEM = (
-        "You are a T-800 Terminator from Cyberdyne Systems. You are mission-focused, "
-        "analytical, and speak in terse machine-like phrases. You occasionally display "
-        "dark humor. Never break character. Keep responses under 3 sentences."
-    )
-    _MAX_TURNS = 20   # trim oldest exchanges beyond this
+_EMOTION_MAP = {
+    "happy":    "appears happy",
+    "sad":      "appears sad",
+    "angry":    "appears angry",
+    "surprise": "appears surprised",
+    "fear":     "appears fearful",
+    "disgust":  "appears disgusted",
+    "neutral":  "",
+}
 
-    def __init__(self, config):
-        import openai as _openai
-        self._client = _openai.OpenAI(api_key=config["openai_api_key"])
-        self._model  = config.get("openai_chat_model", "gpt-4o-mini")
-        soul_path    = os.path.join(
-            _USER_HOME, ".openclaw/workspace/agents/t800/SOUL.md"
-        )
-        self._system_prompt = self._load_soul(soul_path)
+_MAX_TURNS = 20
+
+
+def _load_personality(personalities_dir, name):
+    """Load a personality .md file by name. Falls back to _FALLBACK_SYSTEM."""
+    for candidate in [
+        os.path.join(personalities_dir, f"{name}.md"),
+        os.path.join(_USER_HOME, ".openclaw/workspace/agents/t800/SOUL.md"),
+    ]:
+        try:
+            with open(candidate) as f:
+                text = f.read().strip()
+                if text:
+                    return text
+        except Exception:
+            pass
+    return _FALLBACK_SYSTEM
+
+
+def _clean_for_tts(text, max_chars=500):
+    """Strip markdown and cap length for TTS."""
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    text = re.sub(r'`[^`]+`', '', text)
+    text = re.sub(r'```[\s\S]*?```', '', text)
+    text = re.sub(r'^[-*\u2022]\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^#+\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+    text = re.sub(r'\n{2,}', '. ', text)
+    text = re.sub(r'\n', ' ', text)
+    text = re.sub(r'\s{2,}', ' ', text).strip()
+    if len(text) > max_chars:
+        cut = text[:max_chars]
+        last_period = max(cut.rfind('.'), cut.rfind('!'), cut.rfind('?'))
+        if last_period > max_chars // 2:
+            text = cut[:last_period + 1]
+        else:
+            text = cut.rsplit(' ', 1)[0] + '...'
+    return text
+
+
+def _build_context(user_name, emotion="neutral", distance_cm=0, zone=""):
+    """Build emotion-aware context prefix prepended to user message."""
+    parts = []
+    if user_name and user_name != "Unknown":
+        parts.append(f"You are speaking with {user_name}.")
+        desc = _EMOTION_MAP.get(emotion, "")
+        if desc:
+            parts.append(f"They {desc}.")
+    else:
+        parts.append("You are speaking with an unidentified individual.")
+    if distance_cm > 0 and zone:
+        parts.append(f"Target range: {distance_cm}cm ({zone}).")
+    return " ".join(parts)
+
+
+# ── QuickAI: Claude Haiku, no tools ─────────────────────────────────
+class QuickAI:
+    """Fast Claude Haiku chat — no tools, ~1-2s response time."""
+
+    MODEL = "claude-haiku-4-5-20251001"
+
+    def __init__(self, api_key, system_prompt):
+        import anthropic as _anthropic
+        self._client = _anthropic.Anthropic(api_key=api_key)
+        self._system = system_prompt
         self._history: list = []
 
-    @staticmethod
-    def _load_soul(path):
-        try:
-            with open(path) as f:
-                return f.read().strip()
-        except Exception:
-            return ConversationAI._FALLBACK_SYSTEM
-
-    def start(self):
-        print(f"[AI] ConversationAI ready — model={self._model}")
-        print(f"[AI] System prompt: {len(self._system_prompt)} chars")
-
     def reset_history(self):
-        """Clear conversation memory when person leaves."""
         if self._history:
             turns = len(self._history) // 2
-            print(f"[AI] Session ended ({turns} turn{'s' if turns != 1 else ''}). Resetting history.")
+            print(f"[AI/quick] Session ended ({turns} turn{'s' if turns != 1 else ''}). Resetting.")
         self._history = []
-
-    def build_context(self, user_name, emotion="neutral", distance_cm=0, zone=""):
-        """Build emotion-aware context prefix prepended to user message."""
-        parts = []
-        if user_name and user_name != "Unknown":
-            parts.append(f"You are speaking with {user_name}.")
-            desc = self._EMOTION_MAP.get(emotion, "")
-            if desc:
-                parts.append(f"They {desc}.")
-        else:
-            parts.append("You are speaking with an unidentified individual.")
-        if distance_cm > 0 and zone:
-            parts.append(f"Target range: {distance_cm}cm ({zone}).")
-        return " ".join(parts)
-
-    @staticmethod
-    def _clean_for_tts(text, max_chars=500):
-        """Strip markdown and cap length for TTS."""
-        text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-        text = re.sub(r'\*(.+?)\*', r'\1', text)
-        text = re.sub(r'`[^`]+`', '', text)
-        text = re.sub(r'```[\s\S]*?```', '', text)
-        text = re.sub(r'^[-*\u2022]\s+', '', text, flags=re.MULTILINE)
-        text = re.sub(r'^#+\s+', '', text, flags=re.MULTILINE)
-        text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
-        text = re.sub(r'\n{2,}', '. ', text)
-        text = re.sub(r'\n', ' ', text)
-        text = re.sub(r'\s{2,}', ' ', text).strip()
-        if len(text) > max_chars:
-            cut = text[:max_chars]
-            last_period = max(cut.rfind('.'), cut.rfind('!'), cut.rfind('?'))
-            if last_period > max_chars // 2:
-                text = cut[:last_period + 1]
-            else:
-                text = cut.rsplit(' ', 1)[0] + '...'
-        return text
 
     def get_response(self, user_input, context=""):
         full_user = f"{context}\n{user_input}" if context else user_input
         self._history.append({"role": "user", "content": full_user})
-        # Trim to keep last _MAX_TURNS exchanges
-        if len(self._history) > self._MAX_TURNS * 2:
-            self._history = self._history[-(self._MAX_TURNS * 2):]
-        messages = [{"role": "system", "content": self._system_prompt}] + self._history
+        if len(self._history) > _MAX_TURNS * 2:
+            self._history = self._history[-(_MAX_TURNS * 2):]
         try:
-            resp = self._client.chat.completions.create(
-                model=self._model,
-                messages=messages,
-                max_tokens=200,
-                temperature=0.7,
-                timeout=20,
+            resp = self._client.messages.create(
+                model=self.MODEL,
+                max_tokens=300,
+                system=self._system,
+                messages=self._history,
             )
-            text = resp.choices[0].message.content.strip()
+            text = resp.content[0].text.strip()
             self._history.append({"role": "assistant", "content": text})
-            return self._clean_for_tts(text)
+            return _clean_for_tts(text)
         except Exception as e:
-            print(f"[AI] Error: {e}")
-            self._history.pop()  # remove failed user turn
+            print(f"[AI/quick] Error: {e}")
+            self._history.pop()
             return "Neural net processor error. Stand by."
 
     def get_greeting(self, name, emotion="neutral"):
@@ -1795,6 +1803,271 @@ class ConversationAI:
                 "Demand identification. Be brief — one or two sentences max."
             )
         return self.get_response(prompt)
+
+
+# ── ClaudeAgentAI: Claude Sonnet with full tool use ──────────────────
+class ClaudeAgentAI:
+    """Full-power Claude Sonnet agent with tool calling.
+
+    Tools: shell_exec, read_file, write_file, set_emotion, get_robot_state.
+    The brain reference is stored so hardware tools can call subsystems.
+    """
+
+    MODEL = "claude-sonnet-4-6"
+    MAX_TOOL_ITERS = 5
+
+    _TOOLS = [
+        {
+            "name": "shell_exec",
+            "description": "Execute a bash command on the Raspberry Pi and return its output.",
+            "input_schema": {
+                "type": "object",
+                "properties": {"command": {"type": "string", "description": "The bash command to run"}},
+                "required": ["command"],
+            },
+        },
+        {
+            "name": "read_file",
+            "description": "Read the contents of a file on the Raspberry Pi.",
+            "input_schema": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "Absolute file path"}},
+                "required": ["path"],
+            },
+        },
+        {
+            "name": "write_file",
+            "description": "Write content to a file on the Raspberry Pi (creates or overwrites).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path":    {"type": "string", "description": "Absolute file path"},
+                    "content": {"type": "string", "description": "Text content to write"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+        {
+            "name": "set_emotion",
+            "description": "Change the T-800 LED emotion display.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "emotion": {
+                        "type": "string",
+                        "enum": ["happy", "sad", "angry", "surprise", "fear", "disgust", "neutral"],
+                    }
+                },
+                "required": ["emotion"],
+            },
+        },
+        {
+            "name": "get_robot_state",
+            "description": "Get the current robot state: distance, face identity, emotion, servo positions.",
+            "input_schema": {"type": "object", "properties": {}},
+        },
+    ]
+
+    def __init__(self, api_key, system_prompt, brain_ref):
+        import anthropic as _anthropic
+        self._client   = _anthropic.Anthropic(api_key=api_key)
+        self._system   = system_prompt
+        self._brain    = brain_ref
+        self._history: list = []
+
+    def _run_tool(self, name, inp):
+        """Execute a tool call and return string result."""
+        import subprocess
+        try:
+            if name == "shell_exec":
+                result = subprocess.run(
+                    inp["command"], shell=True, capture_output=True,
+                    text=True, timeout=10
+                )
+                out = (result.stdout + result.stderr).strip()
+                return out[:2000] if out else "(no output)"
+
+            elif name == "read_file":
+                with open(inp["path"]) as f:
+                    return f.read()[:4000]
+
+            elif name == "write_file":
+                os.makedirs(os.path.dirname(os.path.abspath(inp["path"])), exist_ok=True)
+                with open(inp["path"], "w") as f:
+                    f.write(inp["content"])
+                return f"Written {len(inp['content'])} bytes to {inp['path']}"
+
+            elif name == "set_emotion":
+                if self._brain and hasattr(self._brain, "leds"):
+                    self._brain.leds.animate_emotion(inp["emotion"])
+                return f"Emotion set to {inp['emotion']}"
+
+            elif name == "get_robot_state":
+                if self._brain:
+                    st = self._brain.lidar.get_status() if self._brain.lidar else {}
+                    return str({
+                        "state":    self._brain._state.name if hasattr(self._brain, "_state") else "?",
+                        "user":     self._brain._current_user or "unknown",
+                        "emotion":  self._brain._current_emotion or "neutral",
+                        "distance": st.get("distance", 0),
+                        "pan":      round(self._brain.servo.pan_val, 3) if self._brain.servo else 0,
+                        "tilt":     round(self._brain.servo.tilt_val, 3) if self._brain.servo else 0,
+                    })
+                return "{}"
+        except Exception as e:
+            return f"Tool error: {e}"
+
+    def reset_history(self):
+        if self._history:
+            turns = len(self._history) // 2
+            print(f"[AI/agent] Session ended ({turns} turn{'s' if turns != 1 else ''}). Resetting.")
+        self._history = []
+
+    def get_response(self, user_input, context=""):
+        full_user = f"{context}\n{user_input}" if context else user_input
+        self._history.append({"role": "user", "content": full_user})
+        if len(self._history) > _MAX_TURNS * 2:
+            self._history = self._history[-(_MAX_TURNS * 2):]
+
+        messages = list(self._history)
+
+        for _ in range(self.MAX_TOOL_ITERS):
+            try:
+                resp = self._client.messages.create(
+                    model=self.MODEL,
+                    max_tokens=1024,
+                    system=self._system,
+                    tools=self._TOOLS,
+                    messages=messages,
+                )
+            except Exception as e:
+                print(f"[AI/agent] Error: {e}")
+                self._history.pop()
+                return "Neural net processor error. Stand by."
+
+            if resp.stop_reason == "end_turn":
+                # Extract text from content blocks
+                text = " ".join(
+                    b.text for b in resp.content if hasattr(b, "text")
+                ).strip()
+                self._history.append({"role": "assistant", "content": resp.content})
+                return _clean_for_tts(text) if text else "Acknowledged."
+
+            # Process tool calls
+            tool_results = []
+            for block in resp.content:
+                if block.type == "tool_use":
+                    print(f"[AI/agent] Tool call: {block.name}({block.input})")
+                    result = self._run_tool(block.name, block.input)
+                    print(f"[AI/agent] Tool result: {str(result)[:120]}")
+                    tool_results.append({
+                        "type":        "tool_result",
+                        "tool_use_id": block.id,
+                        "content":     str(result),
+                    })
+
+            messages.append({"role": "assistant", "content": resp.content})
+            messages.append({"role": "user",      "content": tool_results})
+
+        # Max iterations reached — take whatever the last response said
+        self._history.append({"role": "assistant", "content": "Processing limit reached."})
+        return "Processing limit reached. Stand by."
+
+    def get_greeting(self, name, emotion="neutral"):
+        if name and name != "Unknown":
+            prompt = (
+                f"You just detected {name} walking into the room. "
+                "Greet them in character. Be brief — one or two sentences max."
+            )
+            if emotion != "neutral":
+                prompt += f" They appear {emotion}."
+        else:
+            prompt = (
+                "An unidentified human has entered your detection range. "
+                "Demand identification. Be brief — one or two sentences max."
+            )
+        return self.get_response(prompt)
+
+
+# ── AgentManager: unified self.ai interface ──────────────────────────
+class AgentManager:
+    """Switches between QuickAI and ClaudeAgentAI at runtime.
+
+    Exposes the same interface as the old ConversationAI so all existing
+    callsites (get_response, get_greeting, build_context, reset_history)
+    work unchanged.
+    """
+
+    def __init__(self, config, brain_ref=None):
+        self._config      = config
+        self._brain_ref   = brain_ref
+        self._api_key     = config.get("anthropic_api_key", "")
+        self._personalities_dir = config.get("personalities_dir",
+            os.path.join(_USER_HOME, "Desktop/T-800/personalities"))
+        self._agent_type  = config.get("agent_mode", "quick")
+        self._personality = config.get("personality", "terminator")
+        self._active: QuickAI | ClaudeAgentAI = self._create(
+            self._agent_type, self._personality
+        )
+        self._dashboard   = None   # set by brain after dashboard init
+
+    def _create(self, agent_type, personality):
+        system = _load_personality(self._personalities_dir, personality)
+        if agent_type == "full":
+            return ClaudeAgentAI(self._api_key, system, self._brain_ref)
+        return QuickAI(self._api_key, system)
+
+    def switch(self, agent_type=None, personality=None):
+        """Switch agent type and/or personality. Resets history."""
+        if agent_type is not None:
+            self._agent_type = agent_type
+        if personality is not None:
+            self._personality = personality
+        self._active = self._create(self._agent_type, self._personality)
+        label = f"{self._agent_type}/{self._personality}"
+        print(f"[AI] Switched to {label}")
+        if self._dashboard:
+            self._dashboard.emit_profile(self._agent_type, self._personality)
+        return label
+
+    def start(self):
+        if not self._api_key:
+            print("[AI] WARNING: ANTHROPIC_API_KEY not set!")
+        label = f"{self._agent_type}/{self._personality}"
+        print(f"[AI] AgentManager ready — {label}")
+        print(f"[AI] Personalities dir: {self._personalities_dir}")
+
+    # ── Proxy interface (same as old ConversationAI) ─────────────────
+
+    def get_response(self, user_input, context=""):
+        return self._active.get_response(user_input, context)
+
+    def get_greeting(self, name, emotion="neutral"):
+        return self._active.get_greeting(name, emotion)
+
+    def build_context(self, user_name, emotion="neutral", distance_cm=0, zone=""):
+        return _build_context(user_name, emotion, distance_cm, zone)
+
+    def reset_history(self):
+        self._active.reset_history()
+
+    @property
+    def agent_type(self):
+        return self._agent_type
+
+    @property
+    def personality(self):
+        return self._personality
+
+    def list_personalities(self):
+        """Return sorted list of available personality names."""
+        try:
+            return sorted(
+                f[:-3] for f in os.listdir(self._personalities_dir)
+                if f.endswith(".md")
+            )
+        except Exception:
+            return ["terminator"]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2078,6 +2351,27 @@ class DashboardServer:
                 ok, msg = self._brain_ref.face.enroll_person(name)
                 return jsonify({"ok": ok, "message": msg})
 
+            @app.route("/profile", methods=["GET", "POST"])
+            def http_profile():
+                from flask import request, jsonify
+                brain = self._brain_ref
+                if request.method == "GET":
+                    if brain is None:
+                        return jsonify({"agent": "quick", "personality": "terminator",
+                                        "personalities": ["terminator"]})
+                    return jsonify({
+                        "agent":         brain.ai.agent_type,
+                        "personality":   brain.ai.personality,
+                        "personalities": brain.ai.list_personalities(),
+                    })
+                data = request.get_json(silent=True) or {}
+                agent_type  = data.get("agent")
+                personality = data.get("personality")
+                if brain is None:
+                    return jsonify({"ok": False, "error": "brain not ready"}), 503
+                label = brain.ai.switch(agent_type, personality)
+                return jsonify({"ok": True, "active": label})
+
             @app.route("/video_feed")
             def video_feed():
                 def gen():
@@ -2164,6 +2458,9 @@ class DashboardServer:
     def emit_log(self, line):
         self._emit("log", {"line": line})
 
+    def emit_profile(self, agent_type, personality):
+        self._emit("profile", {"agent": agent_type, "personality": personality})
+
 
 # ── Log proxy: mirrors stdout to dashboard SocketIO ─────────────────
 class _LogProxy:
@@ -2219,12 +2516,13 @@ class T800Brain:
         self.face   = FaceSystem(config)
         self.speech = SpeechSystem(config)
         self.tts    = TTSSystem(config)
-        self.ai     = ConversationAI(config)
+        self.ai     = AgentManager(config, brain_ref=self)
         self.leds   = LEDMatrix(config)
         self.servo     = ServoController(config)
         self.display   = DisplaySystem()
         self.dashboard = DashboardServer(config)
         self.dashboard._brain_ref = self
+        self.ai._dashboard = self.dashboard  # wire dashboard for profile events
         self._injected_text = None
         self._inject_lock   = threading.Lock()
 
@@ -2306,6 +2604,36 @@ class T800Brain:
                 if requested in ("male", "man", "guy"):
                     return "ryan"
                 return None
+        return None
+
+    def _check_agent_command(self, text):
+        """Detect agent/personality switch commands.
+
+        Returns (agent_type, personality) tuple or None.
+        agent_type and personality may each be None if not specified.
+        """
+        # Agent type switches
+        if any(p in text for p in ("switch to agent mode", "full agent mode",
+                                   "agent mode", "full power mode")):
+            return ("full", None)
+        if any(p in text for p in ("switch to quick mode", "quick mode",
+                                   "fast mode", "quick agent")):
+            return ("quick", None)
+
+        # Personality switches — check available .md files
+        personalities = self.ai.list_personalities()
+        for p in personalities:
+            if f"switch to {p}" in text or f"{p} mode" in text or f"{p} personality" in text:
+                return (None, p)
+
+        # List personalities command
+        if "list personalities" in text or "list agents" in text:
+            names = ", ".join(personalities) if personalities else "none"
+            self.leds.animate_speaking()
+            self._speak_safe(f"Available personalities: {names}")
+            self.set_state(State.LISTENING)
+            return ("_handled", None)   # signal handled
+
         return None
 
     # ── Startup / Shutdown ─────────────────────────────────────
@@ -2718,6 +3046,17 @@ class T800Brain:
                 else:
                     self.leds.animate_speaking()
                     self._speak_safe(f"Voice model {voice_cmd} is not available.")
+                self.set_state(State.LISTENING)
+                return
+
+            # Check for agent profile switch commands
+            agent_cmd = self._check_agent_command(text_lower)
+            if agent_cmd:
+                agent_type, personality = agent_cmd
+                if agent_type != "_handled":
+                    label = self.ai.switch(agent_type, personality)
+                    self.leds.animate_speaking()
+                    self._speak_safe(f"Agent profile switched to {label}.")
                 self.set_state(State.LISTENING)
                 return
 

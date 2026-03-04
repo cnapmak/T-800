@@ -65,6 +65,8 @@ class T800State:
         self.standby    = False
         self.pan        = 0.0
         self.tilt       = 0.0
+        self.agent_type = "quick"
+        self.personality= "terminator"
         self.log        = deque(maxlen=MAX_LOG)
 
     def update(self, **kwargs):
@@ -88,9 +90,11 @@ class T800State:
                 "heard":     self.heard,
                 "said":      self.said,
                 "standby":   self.standby,
-                "pan":       self.pan,
-                "tilt":      self.tilt,
-                "log":       list(self.log),
+                "pan":        self.pan,
+                "tilt":       self.tilt,
+                "agent_type": self.agent_type,
+                "personality":self.personality,
+                "log":        list(self.log),
             }
 
 
@@ -106,6 +110,8 @@ def make_layout(snap):
                   style=HEADER)
     header.append("  ")
     header.append_text(conn_txt)
+    agent_label = f"  [ {snap.get('agent_type','?').upper()} / {snap.get('personality','?')} ]"
+    header.append(agent_label, style="bold cyan")
     if snap.get("standby"):
         header.append("  [ STANDBY ]", style="bold yellow")
 
@@ -245,6 +251,13 @@ def run_client(host, port, t8state):
         t8state.update(
             pan =float(data.get("pan",  0.0)),
             tilt=float(data.get("tilt", 0.0)),
+        )
+
+    @sio.on("profile")
+    def on_profile(data):
+        t8state.update(
+            agent_type  = data.get("agent", "quick"),
+            personality = data.get("personality", "terminator"),
         )
 
     @sio.on("log")
