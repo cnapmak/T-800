@@ -1034,7 +1034,7 @@ class ServoController:
             self.pan_val  = float(np.clip(self.pan_val  + self.KP * ex,  -1.0, 1.0))
             moved = True
         if abs(ey) > self.DEAD_ZONE:
-            self.tilt_val = float(np.clip(self.tilt_val + self.KP * ey, -1.0, 1.0))
+            self.tilt_val = float(np.clip(self.tilt_val - self.KP * ey, -1.0, 1.0))
             moved = True
         self._write(self._to_deg(self.pan_val), self._to_deg(self.tilt_val))
 
